@@ -136,9 +136,9 @@ impl eframe::App for SetupApp {
                             [215.0, 36.0],
                             egui::Button::new(
                                 RichText::new(if self.en {
-                                    "🚀 Install to System Apps"
+                                    "Install to System Apps"
                                 } else {
-                                    "🚀 Sisteme Kur (Uygulamalar)"
+                                    "Sisteme Kur (Uygulamalar)"
                                 })
                                 .strong()
                                 .color(Color32::WHITE),
@@ -177,9 +177,9 @@ impl eframe::App for SetupApp {
                             [195.0, 36.0],
                             egui::Button::new(
                                 RichText::new(if self.en {
-                                    "📁 Extract Portable Here"
+                                    "Extract Portable Here"
                                 } else {
-                                    "📁 Buraya Taşınabilir Çıkar"
+                                    "Buraya Taşınabilir Çıkar"
                                 })
                                 .strong(),
                             ),
@@ -253,6 +253,25 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "PulseGlass Setup",
         options,
-        Box::new(|_| Ok(Box::new(SetupApp::default()))),
+        Box::new(|cc| {
+            let mut fonts = egui::FontDefinitions::default();
+            for path in [
+                r"C:\Windows\Fonts\segoeui.ttf",
+                r"C:\Windows\Fonts\arial.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ] {
+                if let Ok(bytes) = std::fs::read(path) {
+                    fonts
+                        .font_data
+                        .insert("sys_ui".to_owned(), egui::FontData::from_owned(bytes));
+                    if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                        f.insert(0, "sys_ui".to_owned());
+                    }
+                    break;
+                }
+            }
+            cc.egui_ctx.set_fonts(fonts);
+            Ok(Box::new(SetupApp::default()))
+        }),
     )
 }
