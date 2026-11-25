@@ -15,7 +15,7 @@ fn load_icon() -> Option<Arc<egui::IconData>> {
     let bytes = include_bytes!("../Assets/app.png");
     let img = image::load_from_memory(bytes)
         .ok()?
-        .resize(64, 64, image::imageops::FilterType::Triangle)
+        .resize(64, 64, image::imageops::FilterType::Lanczos3)
         .into_rgba8();
     let (width, height) = img.dimensions();
     Some(Arc::new(egui::IconData {
@@ -23,6 +23,46 @@ fn load_icon() -> Option<Arc<egui::IconData>> {
         width,
         height,
     }))
+}
+
+fn load_icon_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let bytes = include_bytes!("../Assets/app.png");
+    let img = image::load_from_memory(bytes)
+        .ok()?
+        .resize(64, 64, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img.into_raw());
+    Some(ctx.load_texture("setup_app_icon", color_image, egui::TextureOptions::LINEAR))
+}
+
+#[cfg(windows)]
+fn apply_win32_window_icon(window_title: &str) -> bool {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, LoadImageW, SendMessageW, SetClassLongPtrW, GCLP_HICON, GCLP_HICONSM,
+        ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, WM_SETICON,
+    };
+    let title_w: Vec<u16> = window_title.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title_w.as_ptr());
+        if hwnd.is_null() {
+            return false;
+        }
+        let hinst = GetModuleHandleW(std::ptr::null());
+        let icon_id = 1usize as *const u16;
+        let h_big = LoadImageW(hinst, icon_id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+        let h_small = LoadImageW(hinst, icon_id, IMAGE_ICON, 16, 16, LR_SHARED);
+        if !h_big.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, h_big as isize);
+            SetClassLongPtrW(hwnd, GCLP_HICON, h_big as isize);
+        }
+        if !h_small.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, h_small as isize);
+            SetClassLongPtrW(hwnd, GCLP_HICONSM, h_small as isize);
+        }
+        !h_big.is_null() || !h_small.is_null()
+    }
 }
 
 fn locate_or_extract_payload() -> Result<PathBuf, String> {
@@ -56,10 +96,13 @@ struct SetupApp {
     launch_after: bool,
     status: String,
     done: bool,
+    icon_tex: Option<egui::TextureHandle>,
+    win_icon_applied: bool,
+    frame_count: u32,
 }
 
-impl Default for SetupApp {
-    fn default() -> Self {
+impl SetupApp {
+    fn new(ctx: &egui::Context) -> Self {
         Self {
             en: false,
             desktop_shortcut: true,
@@ -67,12 +110,23 @@ impl Default for SetupApp {
             launch_after: true,
             status: String::new(),
             done: false,
+            icon_tex: load_icon_texture(ctx),
+            win_icon_applied: false,
+            frame_count: 0,
         }
     }
 }
 
 impl eframe::App for SetupApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame_count = self.frame_count.saturating_add(1);
+        #[cfg(windows)]
+        if !self.win_icon_applied && self.frame_count <= 20 {
+            if apply_win32_window_icon("PulseGlass Setup") {
+                self.win_icon_applied = true;
+            }
+        }
+
         let primary = Color32::from_rgb(255, 77, 109);
         let secondary = Color32::from_rgb(255, 176, 133);
         let bg = Color32::from_rgb(18, 15, 24);
@@ -81,6 +135,12 @@ impl eframe::App for SetupApp {
             .frame(egui::Frame::none().fill(bg).inner_margin(egui::Margin::same(18.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if let Some(ref tex) = self.icon_tex {
+                        ui.add(
+                            egui::Image::new((tex.id(), egui::vec2(24.0, 24.0)))
+                                .rounding(Rounding::same(5.0)),
+                        );
+                    }
                     ui.label(
                         RichText::new(format!("PulseGlass v{} Kurulum / Setup", installer::APP_VERSION))
                             .strong()
@@ -271,7 +331,7 @@ fn main() -> eframe::Result<()> {
                 }
             }
             cc.egui_ctx.set_fonts(fonts);
-            Ok(Box::new(SetupApp::default()))
+            Ok(Box::new(SetupApp::new(&cc.egui_ctx)))
         }),
     )
 }
