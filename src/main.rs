@@ -107,8 +107,9 @@ fn main() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("PulseGlass Hardware Monitor")
-        .with_inner_size([480.0, 264.0])
+        .with_inner_size([480.0, 294.0])
         .with_min_inner_size([120.0, 24.0])
+        .with_resizable(false)
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()
