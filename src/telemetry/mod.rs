@@ -94,6 +94,12 @@ fn run_worker(
     #[cfg(windows)]
     let etw_fps = windows::EtwFpsMonitor::start();
     #[cfg(windows)]
+    let dwm_pid: Option<u32> = sys
+        .processes()
+        .iter()
+        .find(|(_, p)| p.name().to_string_lossy().eq_ignore_ascii_case("dwm.exe"))
+        .map(|(pid, _)| pid.as_u32());
+    #[cfg(windows)]
     let pdh_thermal = windows::PdhThermalReader::try_new();
 
     #[cfg(target_os = "linux")]
@@ -277,15 +283,15 @@ fn run_worker(
         snap.network.download_mbps = (rx_bytes as f32) / (elapsed * 1024.0 * 1024.0);
         snap.network.upload_mbps = (tx_bytes as f32) / (elapsed * 1024.0 * 1024.0);
 
-        // 7. FPS (RTSS -> DXGI ETW)
+        // 7. FPS (RTSS -> Multi-Provider ETW: DXGI / D3D9 / DxgKrnl)
         #[cfg(windows)]
         {
             if let Some(f) = windows::read_rtss_fps() {
                 snap.fps = Some(f);
                 snap.fps_source = "RTSS".to_string();
-            } else if let Some(f) = etw_fps.get_fps() {
+            } else if let Some(f) = etw_fps.get_fps(dwm_pid) {
                 snap.fps = Some(f);
-                snap.fps_source = "DXGI".to_string();
+                snap.fps_source = "ETW".to_string();
             }
         }
 
