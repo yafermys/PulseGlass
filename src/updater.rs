@@ -201,6 +201,8 @@ pub fn download_and_apply_app_update(download_url: &str, en: bool) -> Result<Str
 
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let cmd_path = std::env::temp_dir().join("pulseglass_update.cmd");
         let script = format!(
             "@echo off\r\ntimeout /t 2 /nobreak >nul\r\nmove /y \"{}\" \"{}\"\r\nstart \"\" \"{}\"\r\ndel \"%~f0\"\r\n",
@@ -211,6 +213,7 @@ pub fn download_and_apply_app_update(download_url: &str, en: bool) -> Result<Str
         fs::write(&cmd_path, script).map_err(|e| e.to_string())?;
         Command::new("cmd.exe")
             .args(["/C", &cmd_path.display().to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| e.to_string())?;
     }
@@ -237,6 +240,8 @@ pub fn download_and_apply_app_update(download_url: &str, en: bool) -> Result<Str
 fn check_os_updates(res: &mut UpdateCheckResult, en: bool) {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let ps = r#"
 $ErrorActionPreference='Stop'
 $s = New-Object -ComObject Microsoft.Update.Session
@@ -258,6 +263,7 @@ $out | ConvertTo-Json -Compress
 "#;
         match Command::new("powershell")
             .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             Ok(out) if out.status.success() => {
@@ -358,6 +364,8 @@ $out | ConvertTo-Json -Compress
 pub fn install_windows_updates(include_optional: bool, en: bool) -> String {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let filter = if include_optional {
             "$true"
         } else {
@@ -380,6 +388,7 @@ Write-Output ("OK:" + $col.Count + ":Reboot=" + $ir.RebootRequired)
         );
         match Command::new("powershell")
             .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             Ok(out) if out.status.success() => {
