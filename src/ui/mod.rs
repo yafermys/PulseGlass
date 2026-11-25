@@ -1,7 +1,9 @@
 pub mod gauges;
 pub mod i18n;
 
-use crate::hotkeys::{start_global_hotkeys, HotkeyAction};
+use crate::hotkeys::{
+    HotkeyAction, HotkeyManager, HotkeySpec, DEFAULT_GHOST_HOTKEY, DEFAULT_SUMMARY_HOTKEY,
+};
 use crate::installer::{
     install_current_to_system, is_autostart_enabled, is_system_installed, open_file_location,
     open_url_non_elevated, set_autostart, uninstall_from_system, APP_VERSION,
@@ -15,7 +17,6 @@ use i18n::I18n;
 
 use egui::{Color32, RichText, Rounding, Stroke, Vec2, ViewportCommand};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -54,7 +55,9 @@ pub struct PulseGlassApp {
     last_osd_size: Vec2,
 
     telemetry: TelemetryHandle,
-    hotkeys: Receiver<HotkeyAction>,
+    hotkeys: HotkeyManager,
+    capturing_hotkey: Option<HotkeyAction>,
+    hotkey_notice: String,
 
     // Process view state
     proc_search: String,
@@ -75,17 +78,220 @@ pub struct PulseGlassApp {
     is_portable: bool,
     autostart_enabled: bool,
 
-    // Optional automated UI screenshot verification (--screenshot-test <path>)
+    // Optional automated UI screenshot verification (--screenshot-test <path> [--screenshot-mode <name>])
     screenshot_out: Option<String>,
+    screenshot_mode: Option<String>,
     screenshot_requested: bool,
     frame_count: u32,
 
     // Native Win32 manual window drag state: (hwnd, start_cursor_x, start_cursor_y, start_win_x, start_win_y)
     win_drag: Option<(isize, i32, i32, i32, i32)>,
+    clamp_pending_frames: u8,
 
     // Embedded app logo texture (shown in header in Widget & Application modes) + Win32 icon state
     app_icon_tex: Option<egui::TextureHandle>,
     win_icon_applied: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MonitorRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl MonitorRect {
+    fn contains_point(&self, x: i32, y: i32) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+
+    fn intersection_area(&self, x: i32, y: i32, w: i32, h: i32) -> i64 {
+        let ix0 = self.left.max(x);
+        let iy0 = self.top.max(y);
+        let ix1 = self.right.min(x + w);
+        let iy1 = self.bottom.min(y + h);
+        if ix1 > ix0 && iy1 > iy0 {
+            (ix1 - ix0) as i64 * (iy1 - iy0) as i64
+        } else {
+            0
+        }
+    }
+
+    fn dist_sq_to_point(&self, x: i32, y: i32) -> i64 {
+        let dx = if x < self.left {
+            (self.left - x) as i64
+        } else if x > self.right {
+            (x - self.right) as i64
+        } else {
+            0
+        };
+        let dy = if y < self.top {
+            (self.top - y) as i64
+        } else if y > self.bottom {
+            (y - self.bottom) as i64
+        } else {
+            0
+        };
+        dx * dx + dy * dy
+    }
+
+    fn clamp_inside(&self, x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+        let max_x = (self.right - w).max(self.left);
+        let max_y = (self.bottom - h).max(self.top);
+        (x.clamp(self.left, max_x), y.clamp(self.top, max_y))
+    }
+}
+
+fn find_best_monitor(x: i32, y: i32, w: i32, h: i32, monitors: &[MonitorRect]) -> Option<MonitorRect> {
+    if monitors.is_empty() {
+        return None;
+    }
+    let cx = x + w / 2;
+    let cy = y + h / 2;
+    // 1. Prefer monitor with largest overlap area
+    let mut best = None;
+    let mut best_area = 0i64;
+    for &m in monitors {
+        let area = m.intersection_area(x, y, w, h);
+        if area > best_area {
+            best_area = area;
+            best = Some(m);
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+    // 2. Otherwise nearest monitor to window center
+    monitors
+        .iter()
+        .copied()
+        .min_by_key(|m| m.dist_sq_to_point(cx, cy))
+}
+
+/// Strictly clamps a window rect `(x, y, w, h)` inside the work area of its active/nearest monitor.
+/// Guarantees zero off-screen pixels in every mode (Compact, Detailed, Summary OSD, FullWindow).
+pub(crate) fn clamp_pos_strict_monitor(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    monitors: &[MonitorRect],
+) -> (i32, i32) {
+    let Some(m) = find_best_monitor(x, y, w, h, monitors) else {
+        return (x, y);
+    };
+    m.clamp_inside(x, y, w, h)
+}
+
+/// Clamps a window during active mouse drag:
+/// - Single monitor: strictly inside `[left..right-w, top..bottom-h]`
+/// - Multiple monitors: allows smooth crossing across shared monitor borders while never escaping outer screen edges or L-shaped dead corners.
+pub(crate) fn clamp_pos_during_drag(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    cursor_x: i32,
+    cursor_y: i32,
+    monitors: &[MonitorRect],
+) -> (i32, i32) {
+    if monitors.is_empty() {
+        return (x, y);
+    }
+    if monitors.len() == 1 {
+        return monitors[0].clamp_inside(x, y, w, h);
+    }
+
+    let cur_mon = monitors
+        .iter()
+        .copied()
+        .find(|m| m.contains_point(cursor_x, cursor_y))
+        .or_else(|| {
+            monitors
+                .iter()
+                .copied()
+                .min_by_key(|m| m.dist_sq_to_point(cursor_x, cursor_y))
+        })
+        .unwrap_or(monitors[0]);
+
+    // Horizontal span of all monitors whose vertical range overlaps the window
+    let mut min_x = cur_mon.left;
+    let mut max_x = cur_mon.right;
+    for &m in monitors {
+        if m.top < y + h && m.bottom > y {
+            min_x = min_x.min(m.left);
+            max_x = max_x.max(m.right);
+        }
+    }
+    let nx = x.clamp(min_x, (max_x - w).max(min_x));
+
+    // Vertical span of all monitors whose horizontal range overlaps the clamped window
+    let mut min_y = cur_mon.top;
+    let mut max_y = cur_mon.bottom;
+    for &m in monitors {
+        if m.left < nx + w && m.right > nx {
+            min_y = min_y.min(m.top);
+            max_y = max_y.max(m.bottom);
+        }
+    }
+    let ny = y.clamp(min_y, (max_y - h).max(min_y));
+
+    // Verify all 4 corners lie within the union of connected monitors (prevents hanging into L-shaped dead corners)
+    let corners = [
+        (nx, ny),
+        (nx + (w - 1).max(0), ny),
+        (nx, ny + (h - 1).max(0)),
+        (nx + (w - 1).max(0), ny + (h - 1).max(0)),
+    ];
+    let all_in_union = corners
+        .iter()
+        .all(|&(cx, cy)| monitors.iter().any(|m| m.contains_point(cx, cy)));
+    if all_in_union {
+        (nx, ny)
+    } else {
+        // Clamp into the monitor under the cursor so crossing into smaller/offset monitors snaps cleanly
+        cur_mon.clamp_inside(nx, ny, w, h)
+    }
+}
+
+#[cfg(windows)]
+fn enumerate_monitor_work_areas() -> Vec<MonitorRect> {
+    use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+
+    unsafe extern "system" fn enum_cb(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rc: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let out = &mut *(data as *mut Vec<MonitorRect>);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmon, &mut info) != 0 {
+            out.push(MonitorRect {
+                left: info.rcWork.left,
+                top: info.rcWork.top,
+                right: info.rcWork.right,
+                bottom: info.rcWork.bottom,
+            });
+        }
+        1
+    }
+
+    let mut mons = Vec::with_capacity(4);
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(enum_cb),
+            (&mut mons as *mut Vec<MonitorRect>) as LPARAM,
+        );
+    }
+    mons
 }
 
 fn load_app_icon_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
@@ -136,21 +342,47 @@ impl PulseGlassApp {
         let app_icon_tex = load_app_icon_texture(&cc.egui_ctx);
 
         let telemetry = TelemetryHandle::spawn(&settings, cc.egui_ctx.clone());
-        let hotkeys = start_global_hotkeys(cc.egui_ctx.clone());
+        let hotkeys = HotkeyManager::start(
+            cc.egui_ctx.clone(),
+            &settings.hotkey_summary,
+            &settings.hotkey_ghost,
+        );
+
+        let args: Vec<String> = std::env::args().collect();
+        let screenshot_out = args
+            .windows(2)
+            .find(|w| w[0] == "--screenshot-test")
+            .map(|w| w[1].clone());
+        let screenshot_mode = args
+            .windows(2)
+            .find(|w| w[0] == "--screenshot-mode")
+            .map(|w| w[1].to_ascii_lowercase());
+
+        let (initial_mode, initial_tab) = match screenshot_mode.as_deref() {
+            Some("summary") => (ViewMode::SummaryOsd, DetailTab::Overview),
+            Some("detailed") => (ViewMode::DetailedWidget, DetailTab::Overview),
+            Some("hardware") => (ViewMode::DetailedWidget, DetailTab::Hardware),
+            Some("settings") => (ViewMode::DetailedWidget, DetailTab::Settings),
+            Some("updates") => (ViewMode::DetailedWidget, DetailTab::Updates),
+            Some("window") => (ViewMode::FullWindow, DetailTab::Overview),
+            _ => (ViewMode::CompactWidget, DetailTab::Overview),
+        };
 
         Self {
             autostart_enabled: is_autostart_enabled(),
             is_installed: is_system_installed(),
             is_portable: is_portable_mode(),
             settings,
-            mode: ViewMode::CompactWidget,
+            mode: initial_mode,
             prev_non_summary_mode: ViewMode::CompactWidget,
-            tab: DetailTab::Overview,
+            tab: initial_tab,
             ghost_mode: false,
             positioned_initial: false,
             last_osd_size: Vec2::ZERO,
             telemetry,
             hotkeys,
+            capturing_hotkey: None,
+            hotkey_notice: String::new(),
             proc_search: String::new(),
             proc_sort: ProcSort::Cpu,
             proc_group: true,
@@ -161,15 +393,12 @@ impl PulseGlassApp {
             startup_update_triggered: false,
             install_desktop_shortcut: true,
             install_status_msg: String::new(),
-            screenshot_out: {
-                let args: Vec<String> = std::env::args().collect();
-                args.windows(2)
-                    .find(|w| w[0] == "--screenshot-test")
-                    .map(|w| w[1].clone())
-            },
+            screenshot_out,
+            screenshot_mode,
             screenshot_requested: false,
             frame_count: 0,
             win_drag: None,
+            clamp_pending_frames: 6,
             app_icon_tex,
             win_icon_applied: false,
         }
@@ -210,21 +439,34 @@ impl PulseGlassApp {
     fn tick_window_drag(&mut self, ctx: &egui::Context) {
         #[cfg(windows)]
         if let Some((hwnd_raw, sx, sy, wx, wy)) = self.win_drag {
-            use windows_sys::Win32::Foundation::POINT;
+            use windows_sys::Win32::Foundation::{POINT, RECT};
             use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
                 GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON,
             };
             use windows_sys::Win32::UI::WindowsAndMessaging::{
-                GetCursorPos, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+                GetCursorPos, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE,
+                SWP_NOZORDER,
             };
             unsafe {
                 let l_down = (GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000) != 0;
                 let m_down = (GetAsyncKeyState(VK_MBUTTON as i32) as u16 & 0x8000) != 0;
                 if l_down || m_down {
                     let mut pt = POINT { x: 0, y: 0 };
-                    if GetCursorPos(&mut pt) != 0 {
-                        let nx = wx + (pt.x - sx);
-                        let ny = wy + (pt.y - sy);
+                    let mut rc = RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    };
+                    if GetCursorPos(&mut pt) != 0 && GetWindowRect(hwnd_raw as _, &mut rc) != 0 {
+                        let win_w = (rc.right - rc.left).max(1);
+                        let win_h = (rc.bottom - rc.top).max(1);
+                        let raw_x = wx + (pt.x - sx);
+                        let raw_y = wy + (pt.y - sy);
+                        let mons = enumerate_monitor_work_areas();
+                        let (nx, ny) = clamp_pos_during_drag(
+                            raw_x, raw_y, win_w, win_h, pt.x, pt.y, &mons,
+                        );
                         let _ = SetWindowPos(
                             hwnd_raw as _,
                             std::ptr::null_mut(),
@@ -234,7 +476,8 @@ impl PulseGlassApp {
                             0,
                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
                         );
-                        if self.mode == ViewMode::CompactWidget || self.mode == ViewMode::SummaryOsd {
+                        if self.mode == ViewMode::CompactWidget || self.mode == ViewMode::SummaryOsd
+                        {
                             let ppp = ctx.pixels_per_point().max(1.0);
                             self.settings.pos_x = Some(nx as f32 / ppp);
                             self.settings.pos_y = Some(ny as f32 / ppp);
@@ -243,12 +486,79 @@ impl PulseGlassApp {
                     ctx.request_repaint();
                 } else {
                     self.win_drag = None;
+                    // On drag release, ensure no edge hangs off-screen on asymmetric multi-monitor layouts
+                    self.clamp_current_win32_window(ctx);
                 }
             }
         }
         #[cfg(not(windows))]
         {
             let _ = ctx;
+        }
+    }
+
+    fn clamp_current_win32_window(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::RECT;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                FindWindowW, GetWindowRect, IsIconic, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE,
+                SWP_NOZORDER,
+            };
+            let title: Vec<u16> = "PulseGlass Hardware Monitor\0".encode_utf16().collect();
+            unsafe {
+                let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                if hwnd.is_null() || IsIconic(hwnd) != 0 {
+                    return;
+                }
+                let mut rc = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                if GetWindowRect(hwnd, &mut rc) == 0 {
+                    return;
+                }
+                let w = (rc.right - rc.left).max(1);
+                let h = (rc.bottom - rc.top).max(1);
+                let mons = enumerate_monitor_work_areas();
+                if mons.is_empty() {
+                    return;
+                }
+                let (cx, cy) = clamp_pos_strict_monitor(rc.left, rc.top, w, h, &mons);
+                if cx != rc.left || cy != rc.top {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        cx,
+                        cy,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    if self.mode == ViewMode::CompactWidget || self.mode == ViewMode::SummaryOsd {
+                        let ppp = ctx.pixels_per_point().max(1.0);
+                        self.settings.pos_x = Some(cx as f32 / ppp);
+                        self.settings.pos_y = Some(cy as f32 / ppp);
+                    }
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if let (Some(rect), Some(mon)) = (
+                ctx.input(|i| i.viewport().outer_rect),
+                ctx.input(|i| i.viewport().monitor_size),
+            ) {
+                let w = rect.width().max(1.0);
+                let h = rect.height().max(1.0);
+                let cx = rect.min.x.clamp(0.0, (mon.x - w).max(0.0));
+                let cy = rect.min.y.clamp(0.0, (mon.y - h).max(0.0));
+                if (cx - rect.min.x).abs() > 1.0 || (cy - rect.min.y).abs() > 1.0 {
+                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(cx, cy)));
+                }
+            }
         }
     }
 
@@ -303,7 +613,7 @@ impl PulseGlassApp {
         ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(self.ghost_mode));
     }
 
-    fn apply_window_geometry(&self, ctx: &egui::Context) {
+    fn apply_window_geometry(&mut self, ctx: &egui::Context) {
         let s = self.settings.ui_scale.clamp(0.85, 1.35);
         if (s - 1.0).abs() > 0.01 {
             ctx.set_zoom_factor(s);
@@ -340,19 +650,15 @@ impl PulseGlassApp {
                     egui::WindowLevel::Normal
                 };
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(lvl));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(660.0, 560.0)));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(660.0, 580.0)));
             }
             ViewMode::FullWindow => {
                 ctx.send_viewport_cmd(ViewportCommand::Resizable(true));
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(900.0, 640.0)));
-                if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
-                    let x = ((mon.x - 900.0) * 0.5).max(16.0);
-                    let y = ((mon.y - 640.0) * 0.5).max(16.0);
-                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
-                }
             }
         }
+        self.clamp_pending_frames = 6;
         #[cfg(windows)]
         {
             let _ = apply_win32_window_icon("PulseGlass Hardware Monitor");
@@ -506,11 +812,35 @@ impl eframe::App for PulseGlassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count = self.frame_count.saturating_add(1);
 
-        // Handle --screenshot-test <path> for automated visual verification
+        // Handle --screenshot-test <path> [--screenshot-mode <name>] for automated visual verification
         if let Some(ref out_path) = self.screenshot_out.clone() {
-            if !self.screenshot_requested && self.frame_count >= 5 {
+            if self.frame_count == 1 && self.screenshot_mode.is_some() {
+                self.apply_window_geometry(ctx);
+                if self.screenshot_mode.as_deref() == Some("updates") {
+                    self.trigger_update_check(ctx);
+                }
+            }
+            let snap_ready = self
+                .telemetry
+                .snapshot
+                .read()
+                .map(|s| s.ram.total_gb > 0.5)
+                .unwrap_or(false);
+            let updates_ready = self
+                .update_result
+                .read()
+                .map(|r| r.is_some())
+                .unwrap_or(false);
+            let data_ready = match self.screenshot_mode.as_deref() {
+                Some("updates") => updates_ready || self.last_update_check.elapsed() > Duration::from_secs(7),
+                Some("settings") => self.frame_count >= 6,
+                _ => (snap_ready && self.frame_count >= 10) || self.last_update_check.elapsed() > Duration::from_secs(5),
+            };
+            if !self.screenshot_requested && data_ready {
                 self.screenshot_requested = true;
                 ctx.send_viewport_cmd(ViewportCommand::Screenshot);
+            } else if !self.screenshot_requested {
+                ctx.request_repaint_after(Duration::from_millis(100));
             }
             let captured = ctx.input(|i| {
                 i.events.iter().find_map(|e| {
@@ -547,22 +877,14 @@ impl eframe::App for PulseGlassApp {
             }
         }
 
-        // 1. Default top-right positioning on first launch (validating saved coords so minimized coords never trap off-screen)
+        // 1. Default top-right positioning on first launch (multi-monitor aware & clamped)
         if !self.positioned_initial {
             self.positioned_initial = true;
-            let mon = ctx.input(|i| i.viewport().monitor_size);
-            let valid_saved = match (self.settings.pos_x, self.settings.pos_y, mon) {
-                (Some(x), Some(y), Some(m)) => {
-                    x >= -100.0 && x <= m.x - 80.0 && y >= 0.0 && y <= m.y - 60.0
-                }
-                (Some(x), Some(y), None) => x > -5000.0 && y > -5000.0,
-                _ => false,
-            };
-            if valid_saved {
-                if let (Some(x), Some(y)) = (self.settings.pos_x, self.settings.pos_y) {
+            if let (Some(x), Some(y)) = (self.settings.pos_x, self.settings.pos_y) {
+                if x > -16000.0 && y > -16000.0 {
                     ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
                 }
-            } else if let Some(m) = mon {
+            } else if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
                 let x = (m.x - 480.0 - 16.0).max(16.0);
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, 16.0)));
                 self.settings.pos_x = Some(x);
@@ -571,32 +893,84 @@ impl eframe::App for PulseGlassApp {
             if (self.settings.ui_scale - 1.0).abs() > 0.01 {
                 ctx.set_zoom_factor(self.settings.ui_scale.clamp(0.85, 1.35));
             }
+            self.clamp_pending_frames = 6;
+        }
+
+        // Enforce strict screen bounds in ALL modes after startup, mode switches, resizes, or periodic safety checks
+        if self.win_drag.is_none() && (self.clamp_pending_frames > 0 || self.frame_count % 15 == 0) {
+            if self.clamp_pending_frames > 0 {
+                self.clamp_pending_frames -= 1;
+            }
+            self.clamp_current_win32_window(ctx);
         }
 
         // Save current position only when on-screen and not minimized (-32000 on Windows)
         if self.mode == ViewMode::CompactWidget || self.mode == ViewMode::SummaryOsd {
             if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-                if rect.min.x > -5000.0 && rect.min.y > -5000.0 {
+                if rect.min.x > -16000.0 && rect.min.y > -16000.0 {
                     self.settings.pos_x = Some(rect.min.x);
                     self.settings.pos_y = Some(rect.min.y);
                 }
             }
         }
 
-        // 2. Process global hotkeys (Ctrl+Enter -> Summary OSD, Shift+Enter -> Ghost Mode)
-        while let Ok(action) = self.hotkeys.try_recv() {
-            match action {
-                HotkeyAction::ToggleSummary => self.toggle_summary(ctx),
-                HotkeyAction::ToggleGhost => self.toggle_ghost(ctx),
+        // 2. Process customizable global hotkeys OR capture new hotkey in Settings
+        if let Some(target_action) = self.capturing_hotkey {
+            // Drain global hotkey queue while rebinding so old/new combo doesn't toggle mid-capture
+            while self.hotkeys.rx.try_recv().is_ok() {}
+            let events = ctx.input(|i| i.events.clone());
+            for ev in events {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                {
+                    if key == egui::Key::Escape {
+                        self.capturing_hotkey = None;
+                        self.hotkey_notice.clear();
+                        break;
+                    }
+                    if let Some(spec) = HotkeySpec::from_egui_key(modifiers, key) {
+                        let combo = spec.format();
+                        let other = match target_action {
+                            HotkeyAction::ToggleSummary => &self.settings.hotkey_ghost,
+                            HotkeyAction::ToggleGhost => &self.settings.hotkey_summary,
+                        };
+                        if combo.eq_ignore_ascii_case(other) {
+                            self.hotkey_notice = if self.settings.language.eq_ignore_ascii_case("en") {
+                                format!("{} is already assigned to the other action.", combo)
+                            } else {
+                                format!("{} zaten diğer kısayola atanmış.", combo)
+                            };
+                        } else {
+                            match target_action {
+                                HotkeyAction::ToggleSummary => {
+                                    self.settings.hotkey_summary = combo;
+                                }
+                                HotkeyAction::ToggleGhost => {
+                                    self.settings.hotkey_ghost = combo;
+                                }
+                            }
+                            self.hotkeys
+                                .rebind(&self.settings.hotkey_summary, &self.settings.hotkey_ghost);
+                            save_settings(&self.settings);
+                            self.capturing_hotkey = None;
+                            self.hotkey_notice.clear();
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            while let Ok(action) = self.hotkeys.rx.try_recv() {
+                match action {
+                    HotkeyAction::ToggleSummary => self.toggle_summary(ctx),
+                    HotkeyAction::ToggleGhost => self.toggle_ghost(ctx),
+                }
             }
         }
-        ctx.input(|i| {
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::Enter) {
-                self.toggle_summary(ctx);
-            } else if i.modifiers.shift && i.key_pressed(egui::Key::Enter) {
-                self.toggle_ghost(ctx);
-            }
-        });
 
         // 3. Startup (after 6s) + 6-hour periodic update check
         if (!self.startup_update_triggered && self.last_update_check.elapsed() > Duration::from_secs(6))
@@ -656,6 +1030,7 @@ impl eframe::App for PulseGlassApp {
                     if (target - self.last_osd_size).length() > 3.0 {
                         self.last_osd_size = target;
                         ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
+                        self.clamp_pending_frames = 4;
                     }
                 });
             return;
@@ -803,8 +1178,13 @@ impl eframe::App for PulseGlassApp {
                                 self.apply_window_geometry(ctx);
                             }
 
+                            let sum_tip = if tr.en {
+                                format!("Summary OSD ({})", self.settings.hotkey_summary)
+                            } else {
+                                format!("Özet Modu ({})", self.settings.hotkey_summary)
+                            };
                             let r = header_btn(ui, tr.t("Özet", "Summary"), false, primary, secondary)
-                                .on_hover_text(tr.t("Özet Modu (Ctrl+Enter)", "Summary OSD (Ctrl+Enter)"));
+                                .on_hover_text(sum_tip);
                             btn_hovered |= r.hovered();
                             if r.clicked() {
                                 self.toggle_summary(ctx);
@@ -818,8 +1198,13 @@ impl eframe::App for PulseGlassApp {
                                 self.apply_window_geometry(ctx);
                             }
 
+                            let ghost_tip = if tr.en {
+                                format!("Ghost Click-Through ({})", self.settings.hotkey_ghost)
+                            } else {
+                                format!("Geçirgen Mod ({})", self.settings.hotkey_ghost)
+                            };
                             let r = header_btn(ui, tr.t("Hayalet", "Ghost"), self.ghost_mode, primary, secondary)
-                                .on_hover_text(tr.t("Geçirgen Mod (Shift+Enter)", "Ghost Click-Through (Shift+Enter)"));
+                                .on_hover_text(ghost_tip);
                             btn_hovered |= r.hovered();
                             if r.clicked() {
                                 self.toggle_ghost(ctx);
@@ -1715,6 +2100,105 @@ impl PulseGlassApp {
         ui.add_space(6.0);
 
         glass_card(ui, secondary, |ui| {
+            ui.label(
+                RichText::new(tr.t("KLAVYE KISAYOLLARI (ÖZELLEŞTİRİLEBİLİR)", "GLOBAL HOTKEYS (CUSTOMIZABLE)"))
+                    .strong()
+                    .size(11.0)
+                    .color(secondary),
+            );
+            ui.add_space(3.0);
+
+            // Row 1: Summary OSD Hotkey
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(tr.t("Özet Modu Aç/Kapat:", "Toggle Summary OSD:")).size(11.5));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(tr.t("Sıfırla", "Reset")).clicked() {
+                        self.capturing_hotkey = None;
+                        self.hotkey_notice.clear();
+                        self.settings.hotkey_summary = DEFAULT_SUMMARY_HOTKEY.to_string();
+                        self.hotkeys
+                            .rebind(&self.settings.hotkey_summary, &self.settings.hotkey_ghost);
+                        save_settings(&self.settings);
+                    }
+                    let cap = self.capturing_hotkey == Some(HotkeyAction::ToggleSummary);
+                    let btn_txt = if cap {
+                        tr.t("Tuşlara basın... (Esc)", "Press keys... (Esc)").to_string()
+                    } else {
+                        self.settings.hotkey_summary.clone()
+                    };
+                    if ui
+                        .button(
+                            RichText::new(btn_txt)
+                                .strong()
+                                .color(if cap { primary } else { Color32::WHITE }),
+                        )
+                        .clicked()
+                    {
+                        self.capturing_hotkey = if cap {
+                            None
+                        } else {
+                            Some(HotkeyAction::ToggleSummary)
+                        };
+                        self.hotkey_notice.clear();
+                    }
+                });
+            });
+
+            // Row 2: Ghost Mode Hotkey
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(tr.t("Hayalet Modu Aç/Kapat:", "Toggle Ghost Mode:")).size(11.5));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(tr.t("Sıfırla", "Reset")).clicked() {
+                        self.capturing_hotkey = None;
+                        self.hotkey_notice.clear();
+                        self.settings.hotkey_ghost = DEFAULT_GHOST_HOTKEY.to_string();
+                        self.hotkeys
+                            .rebind(&self.settings.hotkey_summary, &self.settings.hotkey_ghost);
+                        save_settings(&self.settings);
+                    }
+                    let cap = self.capturing_hotkey == Some(HotkeyAction::ToggleGhost);
+                    let btn_txt = if cap {
+                        tr.t("Tuşlara basın... (Esc)", "Press keys... (Esc)").to_string()
+                    } else {
+                        self.settings.hotkey_ghost.clone()
+                    };
+                    if ui
+                        .button(
+                            RichText::new(btn_txt)
+                                .strong()
+                                .color(if cap { primary } else { Color32::WHITE }),
+                        )
+                        .clicked()
+                    {
+                        self.capturing_hotkey = if cap {
+                            None
+                        } else {
+                            Some(HotkeyAction::ToggleGhost)
+                        };
+                        self.hotkey_notice.clear();
+                    }
+                });
+            });
+
+            ui.label(
+                RichText::new(tr.t(
+                    "İpucu: Değiştirmek için kısayol kutusuna tıklayın, yeni tuş kombinasyonuna basın (örn. Ctrl+Alt+S veya F9). İptal için Esc.",
+                    "Tip: Click a shortcut button and press your desired key combo (e.g. Ctrl+Alt+S or F9). Press Esc to cancel.",
+                ))
+                .size(10.0)
+                .color(Color32::GRAY),
+            );
+            let hk_warn = self.hotkeys.warning();
+            if !self.hotkey_notice.is_empty() {
+                ui.label(RichText::new(&self.hotkey_notice).size(10.5).color(primary));
+            } else if !hk_warn.is_empty() {
+                ui.label(RichText::new(hk_warn).size(10.5).color(primary));
+            }
+        });
+
+        ui.add_space(6.0);
+
+        glass_card(ui, secondary, |ui| {
             ui.label(RichText::new(tr.t("GÖRÜNÜM & BAĞIMSIZ ŞEFFAFLIK", "APPEARANCE & INDEPENDENT OPACITY")).strong().size(11.0).color(secondary));
             ui.horizontal(|ui| {
                 ui.label(tr.t("Dil / Language:", "Language / Dil:"));
@@ -1735,10 +2219,17 @@ impl PulseGlassApp {
                     .text(tr.t("Pencere Opaklığı", "Window Opacity")),
             );
             ui.label(
-                RichText::new(tr.t(
-                    "Not: Özet modu (Ctrl+Enter) her zaman tam şeffaftır ve diğer opaklık ayarlarını etkilemez.",
-                    "Note: Summary OSD (Ctrl+Enter) is always fully transparent and independent of Widget/Window opacity.",
-                ))
+                RichText::new(if tr.en {
+                    format!(
+                        "Note: Summary OSD ({}) is always fully transparent and independent of Widget/Window opacity.",
+                        self.settings.hotkey_summary
+                    )
+                } else {
+                    format!(
+                        "Not: Özet modu ({}) her zaman tam şeffaftır ve diğer opaklık ayarlarını etkilemez.",
+                        self.settings.hotkey_summary
+                    )
+                })
                 .size(10.0)
                 .color(Color32::GRAY),
             );
@@ -1788,12 +2279,12 @@ impl PulseGlassApp {
         ui.add_space(6.0);
 
         glass_card(ui, secondary, |ui| {
-            ui.label(
-                RichText::new(tr.t("ÖZET MODU (CTRL+ENTER) DEĞERLERİ", "SUMMARY OSD (CTRL+ENTER) METRICS"))
-                    .strong()
-                    .size(11.0)
-                    .color(secondary),
-            );
+            let sum_hdr = if tr.en {
+                format!("SUMMARY OSD ({}) METRICS", self.settings.hotkey_summary.to_uppercase())
+            } else {
+                format!("ÖZET MODU ({}) DEĞERLERİ", self.settings.hotkey_summary.to_uppercase())
+            };
+            ui.label(RichText::new(sum_hdr).strong().size(11.0).color(secondary));
             ui.columns(2, |cols| {
                 cols[0].checkbox(&mut self.settings.sum_cpu_pct, "CPU %");
                 cols[0].checkbox(&mut self.settings.sum_cpu_temp, "CPU °C");
@@ -2012,4 +2503,88 @@ fn configure_visuals(ctx: &egui::Context) {
     style.visuals.widgets.hovered.rounding = Rounding::same(6.0);
     style.visuals.widgets.active.rounding = Rounding::same(6.0);
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+
+    #[test]
+    fn single_monitor_never_escapes_any_edge() {
+        let mons = [MonitorRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        }];
+        assert_eq!(clamp_pos_during_drag(-150, -40, 480, 294, -50, -10, &mons), (0, 0));
+        assert_eq!(
+            clamp_pos_during_drag(1800, 900, 480, 294, 1900, 1000, &mons),
+            (1920 - 480, 1040 - 294)
+        );
+        assert_eq!(
+            clamp_pos_strict_monitor(1700, 800, 660, 580, &mons),
+            (1920 - 660, 1040 - 580)
+        );
+    }
+
+    #[test]
+    fn dual_monitors_allow_smooth_crossing_but_block_outer_edges() {
+        let mons = [
+            MonitorRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040,
+            },
+            MonitorRect {
+                left: 1920,
+                top: 0,
+                right: 3840,
+                bottom: 1040,
+            },
+        ];
+        // Straddling x=1920 border during drag is allowed!
+        assert_eq!(
+            clamp_pos_during_drag(1750, 100, 480, 294, 1950, 120, &mons),
+            (1750, 100)
+        );
+        // Outer left edge blocked
+        assert_eq!(
+            clamp_pos_during_drag(-200, 100, 480, 294, 10, 120, &mons),
+            (0, 100)
+        );
+        // Outer right edge of 2nd monitor blocked
+        assert_eq!(
+            clamp_pos_during_drag(3700, 100, 480, 294, 3800, 120, &mons),
+            (3840 - 480, 100)
+        );
+        // On mode switch while mostly on monitor 2, clamps cleanly into monitor 2
+        assert_eq!(
+            clamp_pos_strict_monitor(3500, 700, 660, 580, &mons),
+            (3840 - 660, 1040 - 580)
+        );
+    }
+
+    #[test]
+    fn asymmetric_l_shaped_monitors_block_dead_corner() {
+        let mons = [
+            MonitorRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            MonitorRect {
+                left: 1920,
+                top: 200,
+                right: 3200,
+                bottom: 920,
+            },
+        ];
+        // Dragging into dead space above monitor 2 (y=50, x=2100) snaps into monitor 2's top (200)
+        let (cx, cy) = clamp_pos_during_drag(2100, 50, 480, 294, 2200, 210, &mons);
+        assert!(cx >= 1920 && cx + 480 <= 3200);
+        assert!(cy >= 200 && cy + 294 <= 920);
+    }
 }
