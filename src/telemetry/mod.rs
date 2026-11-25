@@ -106,7 +106,7 @@ fn run_worker(
         last_time = loop_start;
         tick = tick.wrapping_add(1);
 
-        sys.refresh_cpu_all();
+        sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::everything());
         sys.refresh_memory();
         networks.refresh();
         if tick == 1 || tick % 10 == 0 {
