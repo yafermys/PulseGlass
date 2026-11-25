@@ -19,9 +19,11 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Diagnostics::Etw::{
     CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
-    CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD,
-    EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD,
+    CONTROLTRACE_HANDLE, ENABLE_TRACE_PARAMETERS, ENABLE_TRACE_PARAMETERS_VERSION_2,
+    EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_ENABLE_PROPERTY_IGNORE_KEYWORD_0,
+    EVENT_FILTER_DESCRIPTOR, EVENT_FILTER_TYPE_EVENT_ID, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
+    EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
+    PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_RAW_TIMESTAMP,
     PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -1115,31 +1117,186 @@ const DXGI_PROVIDER_GUID: GUID = GUID {
     data4: [0xA6, 0xAD, 0xF0, 0x3C, 0xFE, 0xD5, 0xD3, 0xC9],
 };
 
-const ETW_SESSION_NAME: &str = "PulseGlass_DXGI_FPS_V2";
+// Microsoft-Windows-D3D9 = {783ACA0A-790E-4D7F-8451-AA850511C6B9}
+const D3D9_PROVIDER_GUID: GUID = GUID {
+    data1: 0x783A_CA0A,
+    data2: 0x790E,
+    data3: 0x4D7F,
+    data4: [0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9],
+};
 
-static ETW_FRAMES: std::sync::OnceLock<Arc<Mutex<HashMap<u32, VecDeque<Instant>>>>> =
-    std::sync::OnceLock::new();
+// Microsoft-Windows-DxgKrnl = {802EC45A-1E99-4B83-9920-87C98277BA9D} (Verified from Intel PresentMon)
+const DXGKRNL_PROVIDER_GUID: GUID = GUID {
+    data1: 0x802E_C45A,
+    data2: 0x1E99,
+    data3: 0x4B83,
+    data4: [0x99, 0x20, 0x87, 0xC9, 0x82, 0x77, 0xBA, 0x9D],
+};
+
+const ETW_SESSION_NAME: &str = "PulseGlass_FPS_Session";
+
+#[repr(C)]
+struct TracePropertiesBuf {
+    props: EVENT_TRACE_PROPERTIES,
+    session_name: [u16; 256],
+}
+
+#[repr(C)]
+struct EventFilterEventIdBuf {
+    filter_in: u8,
+    reserved: u8,
+    count: u16,
+    events: [u16; 4],
+}
+
+#[derive(Clone, Copy)]
+struct FrameSample {
+    qpc: i64,
+    arrived: Instant,
+}
+
+struct EtwFpsState {
+    self_pid: u32,
+    qpc_freq: i64,
+    /// Tier 1: DXGI (DX10/11/12) + D3D9 Present_Start per PID
+    api_frames: HashMap<u32, VecDeque<FrameSample>>,
+    /// Tier 2: DxgKrnl Present_Info (184) per PID (OpenGL / Vulkan / DXGI fallback)
+    krnl_present_frames: HashMap<u32, VecDeque<FrameSample>>,
+    /// Tier 3: DxgKrnl PresentHistory_Start (171) per PID (FlipModel / windowed fallback)
+    krnl_history_frames: HashMap<u32, VecDeque<FrameSample>>,
+}
+
+static ETW_STATE: std::sync::OnceLock<Arc<Mutex<EtwFpsState>>> = std::sync::OnceLock::new();
+
+fn guid_eq(a: &GUID, b: &GUID) -> bool {
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
+}
+
+fn query_qpc_freq() -> i64 {
+    type FnQpf = unsafe extern "system" fn(*mut i64) -> i32;
+    let w = to_wide("kernel32.dll");
+    unsafe {
+        let m = LoadLibraryW(w.as_ptr());
+        if !m.is_null() {
+            if let Some(p) = GetProcAddress(m, b"QueryPerformanceFrequency\0".as_ptr()) {
+                let f: FnQpf = std::mem::transmute(p);
+                let mut freq = 0i64;
+                if f(&mut freq) != 0 && freq > 0 {
+                    return freq;
+                }
+            }
+        }
+    }
+    10_000_000
+}
+
+unsafe fn enable_provider_filtered(
+    session_handle: CONTROLTRACE_HANDLE,
+    session_guid: GUID,
+    provider_guid: &GUID,
+    match_any_keyword: u64,
+    event_ids: &[u16],
+) -> u32 {
+    if !event_ids.is_empty() && event_ids.len() <= 4 {
+        let mut filter_id = EventFilterEventIdBuf {
+            filter_in: 1, // TRUE: keep only listed Event IDs in kernel
+            reserved: 0,
+            count: event_ids.len() as u16,
+            events: [0u16; 4],
+        };
+        for (i, &id) in event_ids.iter().enumerate() {
+            filter_id.events[i] = id;
+        }
+        let filter_bytes = 4 + event_ids.len() * 2;
+        let mut filter_desc = EVENT_FILTER_DESCRIPTOR {
+            Ptr: (&filter_id as *const EventFilterEventIdBuf) as u64,
+            Size: filter_bytes as u32,
+            Type: EVENT_FILTER_TYPE_EVENT_ID,
+        };
+        let params = ENABLE_TRACE_PARAMETERS {
+            Version: ENABLE_TRACE_PARAMETERS_VERSION_2,
+            EnableProperty: EVENT_ENABLE_PROPERTY_IGNORE_KEYWORD_0,
+            ControlFlags: 0,
+            SourceId: session_guid,
+            EnableFilterDesc: &mut filter_desc,
+            FilterDescCount: 1,
+        };
+        let st = EnableTraceEx2(
+            session_handle,
+            provider_guid,
+            EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+            5, // TRACE_LEVEL_VERBOSE (accepts win_LogAlways=0 .. Verbose=5)
+            match_any_keyword,
+            0,
+            0,
+            &params,
+        );
+        if st == 0 {
+            return 0;
+        }
+    }
+
+    // Fallback without Event ID filter if OS rejected filter descriptor
+    EnableTraceEx2(
+        session_handle,
+        provider_guid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        5,
+        match_any_keyword,
+        0,
+        0,
+        std::ptr::null(),
+    )
+}
 
 unsafe extern "system" fn etw_record_callback(record: *mut EVENT_RECORD) {
     if record.is_null() {
         return;
     }
     let hdr = &(*record).EventHeader;
+    let pid = hdr.ProcessId;
+    if pid == 0 {
+        return;
+    }
     let id = hdr.EventDescriptor.Id;
     let opcode = hdr.EventDescriptor.Opcode;
-    // DXGI Present_Start: Id 42, 44, 55 with Opcode 1
-    if (id == 42 || id == 44 || id == 55) && opcode == 1 {
-        let pid = hdr.ProcessId;
-        if pid == 0 {
-            return;
-        }
-        if let Some(map_arc) = ETW_FRAMES.get() {
-            if let Ok(mut map) = map_arc.try_lock() {
-                let q = map.entry(pid).or_default();
-                q.push_back(Instant::now());
-                if q.len() > 1000 {
-                    q.pop_front();
-                }
+    let prov = &hdr.ProviderId;
+
+    // Exact PresentMon (Provider, EventId, Opcode) classification
+    let tier: u8 = if (guid_eq(prov, &DXGI_PROVIDER_GUID) && (id == 42 || id == 55) && opcode == 1)
+        || (guid_eq(prov, &D3D9_PROVIDER_GUID) && id == 1 && opcode == 1)
+    {
+        1
+    } else if guid_eq(prov, &DXGKRNL_PROVIDER_GUID) && id == 184 && opcode == 0 {
+        2
+    } else if guid_eq(prov, &DXGKRNL_PROVIDER_GUID) && id == 171 && opcode == 1 {
+        3
+    } else {
+        0
+    };
+
+    if tier == 0 {
+        return;
+    }
+
+    if let Some(state_arc) = ETW_STATE.get() {
+        if let Ok(mut st) = state_arc.try_lock() {
+            if pid == st.self_pid {
+                return;
+            }
+            let sample = FrameSample {
+                qpc: hdr.TimeStamp,
+                arrived: Instant::now(),
+            };
+            let map = match tier {
+                1 => &mut st.api_frames,
+                2 => &mut st.krnl_present_frames,
+                _ => &mut st.krnl_history_frames,
+            };
+            let q = map.entry(pid).or_default();
+            q.push_back(sample);
+            if q.len() > 1200 {
+                q.pop_front();
             }
         }
     }
@@ -1147,62 +1304,98 @@ unsafe extern "system" fn etw_record_callback(record: *mut EVENT_RECORD) {
 
 pub struct EtwFpsMonitor {
     trace_handle: u64,
+    session_handle: u64,
+    _session_w: Vec<u16>,
     running: bool,
 }
 
 impl EtwFpsMonitor {
     pub fn start() -> Self {
-        let _ = ETW_FRAMES.set(Arc::new(Mutex::new(HashMap::new())));
+        let _ = ETW_STATE.set(Arc::new(Mutex::new(EtwFpsState {
+            self_pid: std::process::id(),
+            qpc_freq: query_qpc_freq(),
+            api_frames: HashMap::new(),
+            krnl_present_frames: HashMap::new(),
+            krnl_history_frames: HashMap::new(),
+        })));
         Self::stop_existing_session();
 
-        let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
-        let total_size = props_size + 512;
-        let mut props_buf = vec![0u8; total_size];
-        let mut session_handle = CONTROLTRACE_HANDLE { Value: 0 };
         let session_w = to_wide(ETW_SESSION_NAME);
+        let mut session_handle = CONTROLTRACE_HANDLE { Value: 0 };
 
         unsafe {
-            let props = props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-            (*props).Wnode.BufferSize = total_size as u32;
-            (*props).Wnode.ClientContext = 1; // QPC
-            (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-            (*props).BufferSize = 64;
-            (*props).MinimumBuffers = 4;
-            (*props).MaximumBuffers = 16;
-            (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-            (*props).FlushTimer = 1;
-            (*props).LoggerNameOffset = props_size as u32;
+            let init_props = |buf: &mut TracePropertiesBuf| {
+                std::ptr::write_bytes(buf as *mut TracePropertiesBuf, 0, 1);
+                buf.props.Wnode.BufferSize = std::mem::size_of::<TracePropertiesBuf>() as u32;
+                buf.props.Wnode.ClientContext = 1; // QPC
+                buf.props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+                buf.props.BufferSize = 64;
+                buf.props.MinimumBuffers = 32;
+                buf.props.MaximumBuffers = 128;
+                buf.props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+                buf.props.FlushTimer = 1;
+                buf.props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+            };
 
-            let st = StartTraceW(&mut session_handle, session_w.as_ptr(), props);
+            let mut props_buf: TracePropertiesBuf = std::mem::zeroed();
+            init_props(&mut props_buf);
+            let mut st = StartTraceW(&mut session_handle, session_w.as_ptr(), &mut props_buf.props);
+            if st == 183 {
+                // ERROR_ALREADY_EXISTS: stop stale session and retry once
+                Self::stop_existing_session();
+                init_props(&mut props_buf);
+                st = StartTraceW(&mut session_handle, session_w.as_ptr(), &mut props_buf.props);
+            }
             if st != 0 {
                 return Self {
                     trace_handle: u64::MAX,
+                    session_handle: 0,
+                    _session_w: session_w,
                     running: false,
                 };
             }
 
-            let st2 = EnableTraceEx2(
+            let session_guid = props_buf.props.Wnode.Guid;
+
+            // Enable DXGI (keyword Events=0x2, IDs 42/55), D3D9 (keyword Events=0x2, ID 1),
+            // and DxgKrnl (keyword Present|Base=0x0800_0001, IDs 184/171; never Performance kw!)
+            let st_dxgi = enable_provider_filtered(
                 session_handle,
+                session_guid,
                 &DXGI_PROVIDER_GUID,
-                EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                5, // TRACE_LEVEL_VERBOSE
-                u64::MAX,
-                0,
-                0,
-                std::ptr::null(),
+                0x2,
+                &[42, 55],
             );
-            if st2 != 0 {
+            let _ = enable_provider_filtered(
+                session_handle,
+                session_guid,
+                &D3D9_PROVIDER_GUID,
+                0x2,
+                &[1],
+            );
+            let st_krnl = enable_provider_filtered(
+                session_handle,
+                session_guid,
+                &DXGKRNL_PROVIDER_GUID,
+                0x0800_0001,
+                &[184, 171],
+            );
+
+            if st_dxgi != 0 && st_krnl != 0 {
                 Self::stop_existing_session();
                 return Self {
                     trace_handle: u64::MAX,
+                    session_handle: 0,
+                    _session_w: session_w,
                     running: false,
                 };
             }
 
             let mut logfile: EVENT_TRACE_LOGFILEW = std::mem::zeroed();
             logfile.LoggerName = session_w.as_ptr() as *mut u16;
-            logfile.Anonymous1.ProcessTraceMode =
-                PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+            logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
+                | PROCESS_TRACE_MODE_EVENT_RECORD
+                | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
             logfile.Anonymous2.EventRecordCallback = Some(etw_record_callback);
 
             let trace_handle = OpenTraceW(&mut logfile);
@@ -1210,8 +1403,19 @@ impl EtwFpsMonitor {
                 Self::stop_existing_session();
                 return Self {
                     trace_handle: u64::MAX,
+                    session_handle: 0,
+                    _session_w: session_w,
                     running: false,
                 };
+            }
+
+            // Use exact PerfFreq from ETW logfile header (matches Intel PresentMon)
+            if logfile.LogfileHeader.PerfFreq > 0 {
+                if let Some(state_arc) = ETW_STATE.get() {
+                    if let Ok(mut st) = state_arc.lock() {
+                        st.qpc_freq = logfile.LogfileHeader.PerfFreq;
+                    }
+                }
             }
 
             let th_val = trace_handle.Value;
@@ -1225,18 +1429,87 @@ impl EtwFpsMonitor {
 
             Self {
                 trace_handle: th_val,
+                session_handle: session_handle.Value,
+                _session_w: session_w,
                 running: true,
             }
         }
     }
 
-    pub fn get_fps(&self) -> Option<u32> {
+    fn calc_fps_from_queue(q: &mut VecDeque<FrameSample>, now: Instant, qpc_freq: i64) -> u32 {
+        // Keep a 2.4s arrival window so ETW's 1s flush latency never drops active FPS to 0/--
+        let arrival_cutoff = now.checked_sub(Duration::from_millis(2400)).unwrap_or(now);
+        while let Some(&front) = q.front() {
+            if front.arrived < arrival_cutoff {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        let Some(&last) = q.back() else {
+            return 0;
+        };
+        // Compute exact FPS from hardware QPC timestamps within the last 1.0 second of the stream
+        let qpc_cutoff = last.qpc.saturating_sub(qpc_freq);
+        let mut first_in_win: Option<i64> = None;
+        let mut count_in_win: u32 = 0;
+        for s in q.iter() {
+            if s.qpc >= qpc_cutoff {
+                if first_in_win.is_none() {
+                    first_in_win = Some(s.qpc);
+                }
+                count_in_win += 1;
+            }
+        }
+        if count_in_win >= 2 {
+            if let Some(first_qpc) = first_in_win {
+                let dt_sec = (last.qpc - first_qpc) as f64 / (qpc_freq as f64);
+                if dt_sec > 0.05 {
+                    let fps = ((count_in_win - 1) as f64 / dt_sec).round() as u32;
+                    return fps.min(2000);
+                }
+            }
+        }
+        count_in_win
+    }
+
+    /// Returns `(foreground_app_fps, best_other_app_fps, dwm_fps)`
+    fn pick_fps(
+        map: &mut HashMap<u32, VecDeque<FrameSample>>,
+        fg_pid: u32,
+        self_pid: u32,
+        dwm_pid: Option<u32>,
+        now: Instant,
+        qpc_freq: i64,
+    ) -> (u32, u32, u32) {
+        let mut fg_fps = 0u32;
+        let mut max_app_fps = 0u32;
+        let mut dwm_fps = 0u32;
+        map.retain(|&pid, q| {
+            let fps = Self::calc_fps_from_queue(q, now, qpc_freq);
+            if pid != self_pid && fps > 0 {
+                if Some(pid) == dwm_pid {
+                    dwm_fps = fps;
+                } else {
+                    if pid == fg_pid {
+                        fg_fps = fps;
+                    }
+                    if fps > max_app_fps {
+                        max_app_fps = fps;
+                    }
+                }
+            }
+            !q.is_empty()
+        });
+        (fg_fps, max_app_fps, dwm_fps)
+    }
+
+    pub fn get_fps(&self, dwm_pid: Option<u32>) -> Option<u32> {
         if !self.running {
             return None;
         }
-        let map_arc = ETW_FRAMES.get()?;
+        let state_arc = ETW_STATE.get()?;
         let now = Instant::now();
-        let cutoff = now.checked_sub(Duration::from_secs(1))?;
 
         let mut fg_pid = 0u32;
         unsafe {
@@ -1246,47 +1519,49 @@ impl EtwFpsMonitor {
             }
         }
 
-        let mut map = map_arc.lock().ok()?;
-        let mut fg_fps = 0u32;
-        let mut max_fps = 0u32;
-        for (&pid, q) in map.iter_mut() {
-            while let Some(&front) = q.front() {
-                if front < cutoff {
-                    q.pop_front();
-                } else {
-                    break;
-                }
-            }
-            let cnt = q.len() as u32;
-            if pid == fg_pid && cnt > 0 {
-                fg_fps = cnt;
-            }
-            if cnt > max_fps {
-                max_fps = cnt;
+        let mut st = state_arc.lock().ok()?;
+        let self_pid = st.self_pid;
+        let qpc_freq = st.qpc_freq;
+
+        let (fg1, max1, dwm1) =
+            Self::pick_fps(&mut st.api_frames, fg_pid, self_pid, dwm_pid, now, qpc_freq);
+        let (fg2, max2, dwm2) =
+            Self::pick_fps(&mut st.krnl_present_frames, fg_pid, self_pid, dwm_pid, now, qpc_freq);
+        let (fg3, max3, dwm3) =
+            Self::pick_fps(&mut st.krnl_history_frames, fg_pid, self_pid, dwm_pid, now, qpc_freq);
+
+        // 1. Prefer active foreground app/game (DXGI/D3D9 -> DxgKrnl Present -> PresentHistory)
+        for f in [fg1, fg2, fg3] {
+            if f > 0 {
+                return Some(f);
             }
         }
-        if fg_fps > 0 {
-            Some(fg_fps)
-        } else if max_fps > 0 {
-            Some(max_fps)
-        } else {
-            None
+        // 2. Otherwise active background game/app (e.g. when user clicks PulseGlass widget)
+        for f in [max1, max2, max3] {
+            if f > 0 {
+                return Some(f);
+            }
         }
+        // 3. Only fall back to DWM desktop compositor when actively animating/composing (>= 15 FPS)
+        for f in [dwm1, dwm2, dwm3] {
+            if f >= 15 {
+                return Some(f);
+            }
+        }
+        None
     }
 
     fn stop_existing_session() {
-        let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
-        let total_size = props_size + 512;
-        let mut props_buf = vec![0u8; total_size];
         let session_w = to_wide(ETW_SESSION_NAME);
         unsafe {
-            let props = props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-            (*props).Wnode.BufferSize = total_size as u32;
-            (*props).LoggerNameOffset = props_size as u32;
+            let mut props_buf: TracePropertiesBuf = std::mem::zeroed();
+            props_buf.props.Wnode.BufferSize = std::mem::size_of::<TracePropertiesBuf>() as u32;
+            props_buf.props.LoggerNameOffset =
+                std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
             let _ = ControlTraceW(
                 CONTROLTRACE_HANDLE { Value: 0 },
                 session_w.as_ptr(),
-                props,
+                &mut props_buf.props,
                 EVENT_TRACE_CONTROL_STOP,
             );
         }
@@ -1295,6 +1570,25 @@ impl EtwFpsMonitor {
 
 impl Drop for EtwFpsMonitor {
     fn drop(&mut self) {
+        if self.session_handle != 0 {
+            unsafe {
+                let mut props_buf: TracePropertiesBuf = std::mem::zeroed();
+                props_buf.props.Wnode.BufferSize = std::mem::size_of::<TracePropertiesBuf>() as u32;
+                props_buf.props.LoggerNameOffset =
+                    std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+                let _ = ControlTraceW(
+                    CONTROLTRACE_HANDLE {
+                        Value: self.session_handle,
+                    },
+                    std::ptr::null(),
+                    &mut props_buf.props,
+                    EVENT_TRACE_CONTROL_STOP,
+                );
+            }
+            self.session_handle = 0;
+        } else {
+            Self::stop_existing_session();
+        }
         if self.trace_handle != u64::MAX {
             unsafe {
                 let _ = CloseTrace(PROCESSTRACE_HANDLE {
@@ -1303,6 +1597,55 @@ impl Drop for EtwFpsMonitor {
             }
             self.trace_handle = u64::MAX;
         }
-        Self::stop_existing_session();
+    }
+}
+
+#[cfg(test)]
+mod etw_tests {
+    use super::*;
+
+    #[test]
+    fn test_etw_qpc_fps_calculation_and_priority() {
+        let freq: i64 = 10_000_000;
+        let now = Instant::now();
+
+        // Simulate 60 FPS frames delivered in a batch 1.1s ago (ETW 1s flush lag must NOT drop FPS to 0!)
+        let mut q60 = VecDeque::new();
+        let arrived_batch = now - Duration::from_millis(1100);
+        for i in 0..61i64 {
+            q60.push_back(FrameSample {
+                qpc: 1_000_000_000 + (i * freq) / 60,
+                arrived: arrived_batch,
+            });
+        }
+        let fps60 = EtwFpsMonitor::calc_fps_from_queue(&mut q60, now, freq);
+        assert!((59..=61).contains(&fps60), "Expected ~60 FPS, got {}", fps60);
+
+        // Simulate 144 FPS game
+        let mut q144 = VecDeque::new();
+        for i in 0..145i64 {
+            q144.push_back(FrameSample {
+                qpc: 2_000_000_000 + (i * freq) / 144,
+                arrived: now - Duration::from_millis(200),
+            });
+        }
+        let fps144 = EtwFpsMonitor::calc_fps_from_queue(&mut q144, now, freq);
+        assert!((142..=146).contains(&fps144), "Expected ~144 FPS, got {}", fps144);
+
+        // Verify priority: real game PID beats DWM even when PulseGlass (self_pid) is foreground
+        let mut map = HashMap::new();
+        map.insert(100u32, q144); // game
+        let mut q_dwm = VecDeque::new();
+        for i in 0..61i64 {
+            q_dwm.push_back(FrameSample {
+                qpc: 3_000_000_000 + (i * freq) / 60,
+                arrived: now,
+            });
+        }
+        map.insert(200u32, q_dwm); // dwm.exe
+        let (fg, max_app, dwm) = EtwFpsMonitor::pick_fps(&mut map, 999, 999, Some(200), now, freq);
+        assert_eq!(fg, 0);
+        assert!((142..=146).contains(&max_app));
+        assert!((59..=61).contains(&dwm));
     }
 }
