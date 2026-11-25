@@ -476,6 +476,39 @@ impl Drop for NvmlReader {
     }
 }
 
+fn read_reg_u64(sub: &RegKey, name: &str) -> Option<u64> {
+    if let Ok(v) = sub.get_value::<u64, _>(name) {
+        return Some(v);
+    }
+    if let Ok(v) = sub.get_value::<u32, _>(name) {
+        return Some(v as u64);
+    }
+    if let Ok(raw) = sub.get_raw_value(name) {
+        if raw.bytes.len() == 8 {
+            return Some(u64::from_le_bytes(raw.bytes[..8].try_into().ok()?));
+        } else if raw.bytes.len() == 4 {
+            return Some(u32::from_le_bytes(raw.bytes[..4].try_into().ok()?) as u64);
+        }
+    }
+    None
+}
+
+pub fn get_installed_ram_gb() -> Option<f32> {
+    type FnGetPhysMem = unsafe extern "system" fn(*mut u64) -> i32;
+    let w = to_wide("kernel32.dll");
+    let m = unsafe { LoadLibraryW(w.as_ptr()) };
+    if m.is_null() {
+        return None;
+    }
+    let p = unsafe { GetProcAddress(m, b"GetPhysicallyInstalledSystemMemory\0".as_ptr()) }?;
+    let f: FnGetPhysMem = unsafe { std::mem::transmute(p) };
+    let mut kb = 0u64;
+    if unsafe { f(&mut kb) } != 0 && kb > 0 {
+        return Some((kb as f64 / (1024.0 * 1024.0)) as f32);
+    }
+    None
+}
+
 /// Discovers Display Adapters from Registry (finds iGPU like Intel UHD/Iris + fallback dGPU).
 pub fn discover_gpus_from_registry() -> (Option<GpuInfo>, Option<GpuInfo>) {
     let mut dgpu: Option<GpuInfo> = None;
@@ -499,14 +532,8 @@ pub fn discover_gpus_from_registry() -> (Option<GpuInfo>, Option<GpuInfo>) {
             continue;
         }
         let driver: String = sub.get_value("DriverVersion").unwrap_or_default();
-        let vram_bytes: u64 = sub
-            .get_value::<u64, _>("HardwareInformation.qwMemorySize")
-            .ok()
-            .or_else(|| {
-                sub.get_value::<u32, _>("HardwareInformation.MemorySize")
-                    .ok()
-                    .map(|v| v as u64)
-            })
+        let vram_bytes = read_reg_u64(&sub, "HardwareInformation.qwMemorySize")
+            .or_else(|| read_reg_u64(&sub, "HardwareInformation.MemorySize"))
             .unwrap_or(0);
         let vram_gb = (vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)) as f32;
 
@@ -701,23 +728,22 @@ impl EmiPowerReader {
                     continue;
                 }
 
-                // Parse channel names (UTF-16 strings inside EMI metadata)
-                let (channel_count, pkg_channel) = if ver == 2 && meta.len() >= 12 {
-                    // EMI_METADATA_V2: MeasurementUnit(4), ChannelCount(4), Channels[]
-                    let count = u32::from_le_bytes(meta[4..8].try_into().unwrap()) as usize;
-                    let mut off = 8usize;
+                // Parse exact Windows SDK EMI_METADATA_V2 layout:
+                // HardwareOEM[32 WCHAR] (64B) + HardwareModel[32 WCHAR] (64B) + HardwareRevision(2B) + ChannelCount(2B) = 132B
+                // Each EMI_CHANNEL_V2: MeasurementUnit(4B) + ChannelNameSize(2B) + ChannelName[ChannelNameSize bytes]
+                let (channel_count, pkg_channel) = if ver == 2 && meta.len() >= 132 {
+                    let count = u16::from_le_bytes([meta[130], meta[131]]) as usize;
+                    let count = count.min(32);
+                    let mut off = 132usize;
                     let mut pkg_idx = None;
-                    for ch in 0..count.min(32) {
-                        if off + 4 > meta.len() {
+                    for ch in 0..count {
+                        if off + 6 > meta.len() {
                             break;
                         }
-                        let ch_size =
-                            u32::from_le_bytes(meta[off..off + 4].try_into().unwrap()) as usize;
-                        if ch_size < 16 || off + ch_size > meta.len() {
-                            break;
-                        }
-                        // ChannelName starts at offset 12 (after ChannelSize, MeasurementUnit, ChannelNameSize)
-                        let name_u16: Vec<u16> = meta[off + 12..off + ch_size]
+                        let name_bytes = u16::from_le_bytes([meta[off + 4], meta[off + 5]]) as usize;
+                        let name_start = off + 6;
+                        let name_end = (name_start + name_bytes).min(meta.len());
+                        let name_u16: Vec<u16> = meta[name_start..name_end]
                             .chunks_exact(2)
                             .map(|c| u16::from_le_bytes([c[0], c[1]]))
                             .take_while(|&v| v != 0)
@@ -727,9 +753,11 @@ impl EmiPowerReader {
                         {
                             pkg_idx = Some(ch);
                         }
-                        off += ch_size;
+                        // EMI_CHANNEL_V2_NEXT_CHANNEL advances by 6 + name_bytes (4-byte aligned)
+                        let step = (6 + name_bytes + 3) & !3;
+                        off += step.max(8);
                     }
-                    (count.min(32), pkg_idx.or(if count > 0 { Some(0) } else { None }))
+                    (count.max(1), pkg_idx.or(if count > 0 { Some(0) } else { None }))
                 } else {
                     (1, Some(0))
                 };
@@ -848,24 +876,24 @@ pub fn poll_power_info(emi: &mut EmiPowerReader, gpu_watts: Option<f32>, gpu_lim
         }
     }
 
-    // On AC power: combine measured CPU Package W + GPU W (+ small platform estimate if both exist)
+    // On AC power: only report Total Device wattage when CPU EMI is actually available;
+    // never misreport GPU-only wattage as total device wattage.
     match (p.cpu_watts, p.gpu_watts) {
         (Some(cw), Some(gw)) => {
-            p.device_total_watts = Some(cw + gw + 8.0);
-            p.source_note = "CPU (EMI) + GPU + Platform".to_string();
+            p.device_total_watts = Some(cw + gw + 10.0);
+            p.source_note = "CPU (EMI) + GPU + Sistem".to_string();
         }
         (Some(cw), None) => {
-            p.device_total_watts = Some(cw + 8.0);
-            p.source_note = "CPU (EMI) + Platform".to_string();
+            p.device_total_watts = Some(cw + 10.0);
+            p.source_note = "CPU (EMI) + Sistem".to_string();
         }
-        (None, Some(gw)) => {
-            p.device_total_watts = Some(gw);
-            p.source_note = "GPU (CPU EMI yok)".to_string();
-        }
-        (None, None) => {
+        (None, _) => {
             if let Some(bw) = p.battery_watts {
                 p.device_total_watts = Some(bw);
                 p.source_note = "Pil Ölçümü".to_string();
+            } else {
+                p.device_total_watts = None;
+                p.source_note = "Adaptörde (Pil sensörü boşta)".to_string();
             }
         }
     }
@@ -895,7 +923,8 @@ const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
 
 pub struct PdhThermalReader {
     query: *mut c_void,
-    counter: *mut c_void,
+    temp_counter: *mut c_void,
+    perf_counter: *mut c_void,
     collect: Option<FnPdhCollectQueryData>,
     get_val: Option<FnPdhGetFormattedCounterValue>,
     close: Option<FnPdhCloseQuery>,
@@ -928,7 +957,7 @@ impl PdhThermalReader {
             return None;
         }
 
-        // Try standard ACPI thermal zone counter paths (concrete instances for PdhGetFormattedCounterValue)
+        // 1. ACPI Thermal Zone counter
         let paths = [
             r"\Thermal Zone Information(\_TZ.TZ01)\Temperature",
             r"\Thermal Zone Information(\_TZ.TZ00)\Temperature",
@@ -937,16 +966,23 @@ impl PdhThermalReader {
             r"\Thermal Zone Information(\_TZ.THRM)\Temperature",
             r"\Thermal Zone Information(\_TZ.TZ0)\Temperature",
         ];
-        let mut counter: *mut c_void = std::ptr::null_mut();
-        let mut added = false;
+        let mut temp_counter: *mut c_void = std::ptr::null_mut();
         for p in &paths {
             let pw = to_wide(p);
-            if unsafe { add(query, pw.as_ptr(), 0, &mut counter) } == 0 && !counter.is_null() {
-                added = true;
+            if unsafe { add(query, pw.as_ptr(), 0, &mut temp_counter) } == 0 && !temp_counter.is_null() {
                 break;
             }
+            temp_counter = std::ptr::null_mut();
         }
-        if !added {
+
+        // 2. Live CPU % Processor Performance (exact Task Manager Turbo GHz multiplier)
+        let mut perf_counter: *mut c_void = std::ptr::null_mut();
+        let perf_path = to_wide(r"\Processor Information(_Total)\% Processor Performance");
+        if unsafe { add(query, perf_path.as_ptr(), 0, &mut perf_counter) } != 0 {
+            perf_counter = std::ptr::null_mut();
+        }
+
+        if temp_counter.is_null() && perf_counter.is_null() {
             if let Some(c) = close {
                 unsafe { c(query) };
             }
@@ -957,34 +993,58 @@ impl PdhThermalReader {
         }
         Some(Self {
             query,
-            counter,
+            temp_counter,
+            perf_counter,
             collect,
             get_val,
             close,
         })
     }
 
-    pub fn read_temp_c(&self) -> Option<f32> {
-        let collect = self.collect?;
-        let get_val = self.get_val?;
-        if unsafe { collect(self.query) } != 0 {
-            return None;
-        }
-        let mut val = PdhFmtCounterValue {
-            c_status: 0,
-            double_value: 0.0,
+    pub fn poll(&self) -> (Option<f32>, Option<f32>) {
+        let (Some(collect), Some(get_val)) = (self.collect, self.get_val) else {
+            return (None, None);
         };
-        let mut ctype = 0u32;
-        if unsafe { get_val(self.counter, PDH_FMT_DOUBLE, &mut ctype, &mut val) } == 0
-            && val.c_status == 0
-        {
-            let k = val.double_value as f32;
-            let c = if k > 200.0 { k - 273.15 } else { k };
-            if c > 15.0 && c < 115.0 {
-                return Some(c.round());
+        if unsafe { collect(self.query) } != 0 {
+            return (None, None);
+        }
+
+        let mut temp_c = None;
+        if !self.temp_counter.is_null() {
+            let mut val = PdhFmtCounterValue {
+                c_status: 0,
+                double_value: 0.0,
+            };
+            let mut ctype = 0u32;
+            if unsafe { get_val(self.temp_counter, PDH_FMT_DOUBLE, &mut ctype, &mut val) } == 0
+                && val.c_status == 0
+            {
+                let k = val.double_value as f32;
+                let c = if k > 200.0 { k - 273.15 } else { k };
+                if c > 15.0 && c < 115.0 {
+                    temp_c = Some(c.round());
+                }
             }
         }
-        None
+
+        let mut perf_pct = None;
+        if !self.perf_counter.is_null() {
+            let mut val = PdhFmtCounterValue {
+                c_status: 0,
+                double_value: 0.0,
+            };
+            let mut ctype = 0u32;
+            if unsafe { get_val(self.perf_counter, PDH_FMT_DOUBLE, &mut ctype, &mut val) } == 0
+                && val.c_status == 0
+            {
+                let pct = val.double_value as f32;
+                if pct > 5.0 && pct < 400.0 {
+                    perf_pct = Some(pct);
+                }
+            }
+        }
+
+        (temp_c, perf_pct)
     }
 }
 
