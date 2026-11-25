@@ -74,6 +74,11 @@ pub struct PulseGlassApp {
     is_installed: bool,
     is_portable: bool,
     autostart_enabled: bool,
+
+    // Optional automated UI screenshot verification (--screenshot-test <path>)
+    screenshot_out: Option<String>,
+    screenshot_requested: bool,
+    frame_count: u32,
 }
 
 impl PulseGlassApp {
@@ -108,6 +113,14 @@ impl PulseGlassApp {
             startup_update_triggered: false,
             install_desktop_shortcut: true,
             install_status_msg: String::new(),
+            screenshot_out: {
+                let args: Vec<String> = std::env::args().collect();
+                args.windows(2)
+                    .find(|w| w[0] == "--screenshot-test")
+                    .map(|w| w[1].clone())
+            },
+            screenshot_requested: false,
+            frame_count: 0,
         }
     }
 
@@ -163,8 +176,8 @@ impl PulseGlassApp {
     }
 
     fn apply_window_geometry(&self, ctx: &egui::Context) {
-        let s = self.settings.ui_scale.clamp(0.80, 1.40);
-        ctx.set_pixels_per_point(ctx.native_pixels_per_point().unwrap_or(1.0) * s);
+        let s = self.settings.ui_scale.clamp(0.85, 1.35);
+        ctx.set_zoom_factor(s);
         match self.mode {
             ViewMode::SummaryOsd => {
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
@@ -272,24 +285,28 @@ impl PulseGlassApp {
 
 fn header_btn(ui: &mut egui::Ui, text: &str, active: bool, primary: Color32) -> egui::Response {
     let fill = if active {
-        Color32::from_rgba_unmultiplied(primary.r(), primary.g(), primary.b(), 70)
+        Color32::from_rgba_unmultiplied(primary.r(), primary.g(), primary.b(), 145)
     } else {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+        Color32::from_rgba_unmultiplied(40, 32, 52, 185)
     };
     let txt_col = if active {
         Color32::WHITE
     } else {
-        Color32::from_rgb(241, 213, 213)
+        Color32::from_rgb(245, 224, 220)
     };
     ui.add(
         egui::Button::new(RichText::new(text).size(10.5).color(txt_col))
             .fill(fill)
             .stroke(Stroke::new(
-                0.8_f32,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 25),
+                0.9_f32,
+                if active {
+                    primary
+                } else {
+                    Color32::from_rgba_unmultiplied(255, 176, 133, 60)
+                },
             ))
             .rounding(Rounding::same(6.0))
-            .min_size(Vec2::new(22.0, 20.0)),
+            .min_size(Vec2::new(22.0, 21.0)),
     )
 }
 
@@ -304,6 +321,41 @@ impl eframe::App for PulseGlassApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame_count = self.frame_count.saturating_add(1);
+
+        // Handle --screenshot-test <path> for automated visual verification
+        if let Some(ref out_path) = self.screenshot_out.clone() {
+            if !self.screenshot_requested && self.frame_count >= 5 {
+                self.screenshot_requested = true;
+                ctx.send_viewport_cmd(ViewportCommand::Screenshot);
+            }
+            let captured = ctx.input(|i| {
+                i.events.iter().find_map(|e| {
+                    if let egui::Event::Screenshot { image, .. } = e {
+                        Some(Arc::clone(image))
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(img) = captured {
+                let rgba: Vec<u8> = img
+                    .pixels
+                    .iter()
+                    .flat_map(|c| [c.r(), c.g(), c.b(), c.a()])
+                    .collect();
+                let _ = image::save_buffer(
+                    out_path,
+                    &rgba,
+                    img.width() as u32,
+                    img.height() as u32,
+                    image::ColorType::Rgba8,
+                );
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+                return;
+            }
+        }
+
         // 1. Default top-right positioning on first launch
         if !self.positioned_initial {
             self.positioned_initial = true;
@@ -408,122 +460,130 @@ impl eframe::App for PulseGlassApp {
             } else {
                 16.0
             }))
+            .outer_margin(egui::Margin::same(4.0))
             .inner_margin(egui::Margin::symmetric(13.0, 10.0));
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(4.0)))
+            .frame(frame)
             .show(ctx, |ui| {
-                frame.show(ui, |ui| {
-                    // --- HEADER BAR (Draggable, clean spacing, ZERO emoji tofu boxes) ---
-                    let header_resp = ui
-                        .horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 5.0;
-                            let dot_color = if !snap.alerts.is_empty() {
-                                Color32::from_rgb(239, 68, 68)
-                            } else {
-                                primary
-                            };
-                            let (dot_rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
-                            ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
+                    // --- HEADER BAR (Draggable ONLY on title/empty space, NEVER covering buttons!) ---
+                    let mut start_drag = false;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        let dot_color = if !snap.alerts.is_empty() {
+                            Color32::from_rgb(239, 68, 68)
+                        } else {
+                            primary
+                        };
+                        let (dot_rect, dot_resp) =
+                            ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::drag());
+                        ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
+                        if dot_resp.drag_started() {
+                            start_drag = true;
+                        }
 
-                            ui.label(
+                        let title_resp = ui.add(
+                            egui::Label::new(
                                 RichText::new("PulseGlass")
                                     .strong()
-                                    .size(12.5)
+                                    .size(13.0)
                                     .color(Color32::from_rgb(255, 241, 235)),
+                            )
+                            .sense(egui::Sense::drag()),
+                        );
+                        if title_resp.drag_started() {
+                            start_drag = true;
+                        }
+
+                        if let Some(alert) = snap.alerts.first() {
+                            ui.label(
+                                RichText::new(format!("! {}", alert))
+                                    .size(10.0)
+                                    .strong()
+                                    .color(primary),
                             );
-
-                            if let Some(alert) = snap.alerts.first() {
-                                ui.label(
-                                    RichText::new(format!("! {}", alert))
-                                        .size(10.0)
-                                        .strong()
-                                        .color(primary),
-                                );
-                            } else if self.ghost_mode {
-                                ui.label(
-                                    RichText::new(tr.t("Geçirgen", "Ghost"))
-                                        .size(10.0)
-                                        .color(secondary),
-                                );
-                            }
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    if header_btn(ui, "×", false, primary)
-                                        .on_hover_text(tr.t("Kapat", "Close"))
-                                        .clicked()
-                                    {
-                                        ctx.send_viewport_cmd(ViewportCommand::Close);
-                                    }
-                                    if header_btn(ui, "—", false, primary)
-                                        .on_hover_text(tr.t("Küçült", "Minimize"))
-                                        .clicked()
-                                    {
-                                        ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-                                    }
-                                    let det_lbl = if self.mode == ViewMode::DetailedWidget {
-                                        tr.t("Widget", "Widget")
-                                    } else {
-                                        tr.t("Detay", "Detail")
-                                    };
-                                    if header_btn(ui, det_lbl, self.mode == ViewMode::DetailedWidget, primary).clicked() {
-                                        self.mode = if self.mode == ViewMode::DetailedWidget {
-                                            ViewMode::CompactWidget
-                                        } else {
-                                            ViewMode::DetailedWidget
-                                        };
-                                        self.apply_window_geometry(ctx);
-                                    }
-                                    let win_lbl = if self.mode == ViewMode::FullWindow {
-                                        tr.t("Widget", "Widget")
-                                    } else {
-                                        tr.t("Pencere", "Window")
-                                    };
-                                    if header_btn(ui, win_lbl, self.mode == ViewMode::FullWindow, primary).clicked() {
-                                        self.mode = if self.mode == ViewMode::FullWindow {
-                                            ViewMode::CompactWidget
-                                        } else {
-                                            ViewMode::FullWindow
-                                        };
-                                        self.apply_window_geometry(ctx);
-                                    }
-                                    if header_btn(ui, tr.t("Özet", "OSD"), false, primary)
-                                        .on_hover_text(tr.t("Özet Modu (Ctrl+Enter)", "Summary OSD (Ctrl+Enter)"))
-                                        .clicked()
-                                    {
-                                        self.toggle_summary(ctx);
-                                    }
-                                    if header_btn(ui, tr.t("Üstte", "Pin"), self.settings.topmost, primary)
-                                        .on_hover_text(tr.t("Her zaman üstte", "Always on top"))
-                                        .clicked()
-                                    {
-                                        self.settings.topmost = !self.settings.topmost;
-                                        self.apply_window_geometry(ctx);
-                                    }
-                                    if header_btn(ui, tr.t("Hayalet", "Ghost"), self.ghost_mode, primary)
-                                        .on_hover_text(tr.t("Geçirgen Mod (Shift+Enter)", "Ghost Click-Through (Shift+Enter)"))
-                                        .clicked()
-                                    {
-                                        self.toggle_ghost(ctx);
-                                    }
-                                },
+                        } else if self.ghost_mode {
+                            ui.label(
+                                RichText::new(tr.t("Geçirgen", "Ghost"))
+                                    .size(10.0)
+                                    .color(secondary),
                             );
-                        })
-                        .response;
+                        }
 
-                    let drag_resp = ui.interact(
-                        header_resp.rect,
-                        egui::Id::new("header_drag"),
-                        egui::Sense::drag(),
-                    );
-                    if drag_resp.drag_started() {
-                        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
-                    }
-                    if ctx.input(|i| i.pointer.middle_down()) {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                if header_btn(ui, "×", false, primary)
+                                    .on_hover_text(tr.t("Kapat", "Close"))
+                                    .clicked()
+                                {
+                                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                                }
+                                if header_btn(ui, "—", false, primary)
+                                    .on_hover_text(tr.t("Küçült", "Minimize"))
+                                    .clicked()
+                                {
+                                    ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                                }
+                                let det_lbl = if self.mode == ViewMode::DetailedWidget {
+                                    tr.t("Widget", "Widget")
+                                } else {
+                                    tr.t("Detay", "Detail")
+                                };
+                                if header_btn(ui, det_lbl, self.mode == ViewMode::DetailedWidget, primary).clicked() {
+                                    self.mode = if self.mode == ViewMode::DetailedWidget {
+                                        ViewMode::CompactWidget
+                                    } else {
+                                        ViewMode::DetailedWidget
+                                    };
+                                    self.apply_window_geometry(ctx);
+                                }
+                                let win_lbl = if self.mode == ViewMode::FullWindow {
+                                    tr.t("Widget", "Widget")
+                                } else {
+                                    tr.t("Pencere", "Window")
+                                };
+                                if header_btn(ui, win_lbl, self.mode == ViewMode::FullWindow, primary).clicked() {
+                                    self.mode = if self.mode == ViewMode::FullWindow {
+                                        ViewMode::CompactWidget
+                                    } else {
+                                        ViewMode::FullWindow
+                                    };
+                                    self.apply_window_geometry(ctx);
+                                }
+                                if header_btn(ui, tr.t("Özet", "OSD"), false, primary)
+                                    .on_hover_text(tr.t("Özet Modu (Ctrl+Enter)", "Summary OSD (Ctrl+Enter)"))
+                                    .clicked()
+                                {
+                                    self.toggle_summary(ctx);
+                                }
+                                if header_btn(ui, tr.t("Üstte", "Pin"), self.settings.topmost, primary)
+                                    .on_hover_text(tr.t("Her zaman üstte", "Always on top"))
+                                    .clicked()
+                                {
+                                    self.settings.topmost = !self.settings.topmost;
+                                    self.apply_window_geometry(ctx);
+                                }
+                                if header_btn(ui, tr.t("Hayalet", "Ghost"), self.ghost_mode, primary)
+                                    .on_hover_text(tr.t("Geçirgen Mod (Shift+Enter)", "Ghost Click-Through (Shift+Enter)"))
+                                    .clicked()
+                                {
+                                    self.toggle_ghost(ctx);
+                                }
+                                // Remaining empty space between title and buttons is draggable
+                                let rem = ui.available_size();
+                                if rem.x > 4.0 {
+                                    let (_, sp) = ui.allocate_exact_size(Vec2::new(rem.x, 20.0), egui::Sense::drag());
+                                    if sp.drag_started() {
+                                        start_drag = true;
+                                    }
+                                }
+                            },
+                        );
+                    });
+
+                    if start_drag || ctx.input(|i| i.pointer.middle_down()) {
                         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                     }
 
@@ -538,7 +598,6 @@ impl eframe::App for PulseGlassApp {
                         }
                         ViewMode::SummaryOsd => {}
                     }
-                });
             });
     }
 }
@@ -650,10 +709,15 @@ impl PulseGlassApp {
         // Compact Telemetry Footer: Storage (M.2/SATA + Temp) + Power (GPU W / Device W) + Network + FPS
         glass_card(ui, secondary, |ui| {
             ui.horizontal(|ui| {
+                let ssd_iface = if snap.storage.primary_interface.is_empty() {
+                    "SSD".to_string()
+                } else {
+                    format!("SSD [{}]", snap.storage.primary_interface)
+                };
                 ui.label(
                     RichText::new(format!(
-                        "SSD [{}]  •  {}  •  %{:.0}",
-                        snap.storage.primary_interface,
+                        "{}  •  {}  •  %{:.0}",
+                        ssd_iface,
                         snap.storage.temp_text(),
                         snap.storage.usage_percent
                     ))
