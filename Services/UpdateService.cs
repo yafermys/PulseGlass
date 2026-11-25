@@ -150,8 +150,11 @@ namespace PulseGlassWidget.Services
 
                     // Support both GitHub Releases API ("tag_name" / "browser_download_url") and custom manifest ("version" / "url")
                     var vMatch = Regex.Match(json, "\"(?:version|tag_name)\"\\s*:\\s*\"([^\"]+)\"");
-                    var exeMatch = Regex.Match(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.exe)\"");
-                    var uMatch = exeMatch.Success ? exeMatch : Regex.Match(json, "\"(?:url|browser_download_url)\"\\s*:\\s*\"([^\"]+)\"");
+                    // Only accept an .exe link. In the GitHub API response the first "url" is the
+                    // release's own API endpoint, so a non-exe fallback would overwrite the app with JSON.
+                    var uMatch = Regex.Match(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]+/PulseGlassWidget\\.exe)\"", RegexOptions.IgnoreCase);
+                    if (!uMatch.Success)
+                        uMatch = Regex.Match(json, "\"(?:browser_download_url|url)\"\\s*:\\s*\"([^\"]+\\.exe)\"", RegexOptions.IgnoreCase);
 
                     if (vMatch.Success)
                     {
@@ -245,6 +248,13 @@ namespace PulseGlassWidget.Services
                     wc.Headers.Add("User-Agent", "PulseGlassWidget/" + CurrentVersion);
                     wc.DownloadFile(downloadUrl, newExe);
                 }
+                if (!HasPeHeader(newExe))
+                {
+                    try { File.Delete(newExe); } catch { }
+                    return isEn
+                        ? "The downloaded file is not a valid program. Update cancelled."
+                        : "İndirilen dosya geçerli bir program değil. Güncelleme iptal edildi.";
+                }
                 string cmdPath = Path.Combine(Path.GetTempPath(), "pulseglass_update.cmd");
                 string script = string.Format(
                     "@echo off\r\ntimeout /t 2 /nobreak >nul\r\nmove /y \"{0}\" \"{1}\"\r\nstart \"\" \"{1}\"\r\ndel \"%~f0\"",
@@ -256,6 +266,14 @@ namespace PulseGlassWidget.Services
             catch (Exception ex)
             {
                 return (isEn ? "App update error: " : "Uygulama güncelleme hatası: ") + ex.Message;
+            }
+        }
+
+        private static bool HasPeHeader(string path)
+        {
+            using (var fs = File.OpenRead(path))
+            {
+                return fs.Length > 2 && fs.ReadByte() == 'M' && fs.ReadByte() == 'Z';
             }
         }
     }
