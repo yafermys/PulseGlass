@@ -70,11 +70,15 @@ fn run_worker(
     ctx: egui::Context,
 ) {
     let mut sys = System::new_all();
+    // Brief warmup so tick 1 immediately reports accurate CPU% instead of 0%
+    std::thread::sleep(Duration::from_millis(200));
     let mut disks_sys = Disks::new_with_refreshed_list();
     let mut networks = Networks::new_with_refreshed_list();
 
     let pawnio = is_pawnio_installed();
     let os_name = System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
+    #[cfg(windows)]
+    let phys_ram_gb = windows::get_installed_ram_gb();
 
     #[cfg(windows)]
     let is_admin = windows::is_elevated();
@@ -136,18 +140,33 @@ fn run_worker(
 
         #[cfg(windows)]
         {
-            snap.cpu.temperature_c = pdh_thermal.as_ref().and_then(|r| r.read_temp_c());
+            if let Some(ref r) = pdh_thermal {
+                let (t, perf_pct) = r.poll();
+                snap.cpu.temperature_c = t;
+                if let Some(pct) = perf_pct {
+                    if snap.cpu.base_clock_ghz > 0.1 {
+                        snap.cpu.current_clock_ghz = snap.cpu.base_clock_ghz * (pct / 100.0);
+                    }
+                }
+            }
         }
         #[cfg(target_os = "linux")]
         {
             snap.cpu.temperature_c = linux::read_cpu_temp();
         }
 
-        // 2. RAM (always formatted cleanly as GB with decimal precision)
+        // 2. RAM (always formatted cleanly as GB with exact hardware installed size)
         let total_mem = sys.total_memory() as f64;
         let used_mem = sys.used_memory() as f64;
         snap.ram.total_gb = (total_mem / (1024.0 * 1024.0 * 1024.0)) as f32;
-        snap.ram.installed_gb = snap.ram.total_gb.ceil();
+        #[cfg(windows)]
+        {
+            snap.ram.installed_gb = phys_ram_gb.unwrap_or_else(|| snap.ram.total_gb.ceil());
+        }
+        #[cfg(not(windows))]
+        {
+            snap.ram.installed_gb = snap.ram.total_gb.ceil();
+        }
         snap.ram.used_gb = (used_mem / (1024.0 * 1024.0 * 1024.0)) as f32;
         snap.ram.free_gb = (snap.ram.total_gb - snap.ram.used_gb).max(0.0);
         snap.ram.usage_percent = if total_mem > 0.0 {
@@ -223,12 +242,24 @@ fn run_worker(
             snap.cpu.package_watts = snap.power.cpu_watts;
         }
 
-        // 6. Network
+        // 6. Network (skip loopback / virtual / filter adapters to prevent double-counting)
         let mut rx_bytes: u64 = 0;
         let mut tx_bytes: u64 = 0;
         let mut best_nic = String::new();
         let mut best_traffic = 0u64;
         for (name, data) in networks.list() {
+            let nl = name.to_lowercase();
+            if nl.contains("loopback")
+                || nl.contains("vethernet")
+                || nl.contains("teredo")
+                || nl.contains("isatap")
+                || nl.contains("pseudo")
+                || nl.contains("wfp")
+                || nl.contains("qos")
+                || nl == "lo"
+            {
+                continue;
+            }
             let r = data.received();
             let t = data.transmitted();
             rx_bytes = rx_bytes.saturating_add(r);
@@ -299,7 +330,7 @@ fn run_worker(
                         .entry(key)
                         .and_modify(|e| {
                             e.instance_count += 1;
-                            e.cpu_percent += item.cpu_percent;
+                            e.cpu_percent = (e.cpu_percent + item.cpu_percent).min(100.0);
                             e.ram_mb += item.ram_mb;
                             e.disk_mbps += item.disk_mbps;
                             if e.exe_path.is_empty() && !item.exe_path.is_empty() {
@@ -355,5 +386,66 @@ pub fn kill_process_by_pid(pid: u32) -> bool {
         p.kill()
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_live_telemetry_sanity() {
+        let mut sys = System::new_all();
+        std::thread::sleep(Duration::from_millis(250));
+        sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::everything());
+        sys.refresh_memory();
+        let cpu_pct = sys.global_cpu_usage();
+        let freq_mhz = sys.cpus().first().map(|c| c.frequency()).unwrap_or(0);
+        let tot_gb = sys.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
+        let used_gb = sys.used_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
+        assert!(tot_gb > 1.0 && used_gb > 0.1 && used_gb <= tot_gb + 0.1);
+        assert!((0.0..=100.0).contains(&cpu_pct));
+        eprintln!(
+            "LIVE_CHECK: CPU={:.1}% @ {} MHz | RAM={:.2}/{:.2} GB",
+            cpu_pct, freq_mhz, used_gb, tot_gb
+        );
+
+        #[cfg(windows)]
+        {
+            let inst_gb = windows::get_installed_ram_gb();
+            let (dgpu, igpu) = windows::discover_gpus_from_registry();
+            let nvml = windows::NvmlReader::try_new();
+            let mut gpu = crate::models::GpuInfo::default();
+            if let Some(ref r) = nvml {
+                r.poll(&mut gpu);
+            }
+            let mut emi = windows::EmiPowerReader::new();
+            std::thread::sleep(Duration::from_millis(300));
+            let pwr = windows::poll_power_info(&mut emi, gpu.power_watts, gpu.power_limit_watts);
+            let pdh = windows::PdhThermalReader::try_new();
+            std::thread::sleep(Duration::from_millis(250));
+            let (cpu_t, perf_pct) = pdh.as_ref().map(|r| r.poll()).unwrap_or((None, None));
+            let turbo_ghz = perf_pct.map(|p| (freq_mhz as f32 / 1000.0) * (p / 100.0));
+            eprintln!(
+                "WIN_CHECK: PhysRAM={:?} | CPU_T={:?} | TurboGHz={:?} | NVML={} temp={:?} util={:.0}% vram={:.2}/{:.2}GB W={:?}/{:?} | RegDGPU={:?} | RegIGPU={:?} | Power: cpuW={:?} gpuW={:?} batW={:?} devW={:?} src='{}'",
+                inst_gb,
+                cpu_t,
+                turbo_ghz,
+                gpu.name,
+                gpu.temperature_c,
+                gpu.usage_percent,
+                gpu.used_vram_gb,
+                gpu.total_vram_gb,
+                gpu.power_watts,
+                gpu.power_limit_watts,
+                dgpu.map(|g| (g.name, g.total_vram_gb)),
+                igpu.map(|g| (g.name, g.total_vram_gb)),
+                pwr.cpu_watts,
+                pwr.gpu_watts,
+                pwr.battery_watts,
+                pwr.device_total_watts,
+                pwr.source_note
+            );
+        }
     }
 }
