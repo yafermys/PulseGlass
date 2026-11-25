@@ -1450,11 +1450,13 @@ impl PulseGlassApp {
             ProcSort::Name => list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         }
 
-        let total_w = ui.available_width().max(420.0);
-        let col_name = (total_w - 255.0).max(160.0);
-        let col_cpu = 70.0;
-        let col_ram = 85.0;
-        let col_disk = 80.0;
+        // Reserve room for Frame horizontal margins (16px) + ScrollArea bar (14px) + 3 column gaps (18px)
+        let avail_w = (ui.available_width() - 14.0).max(340.0);
+        let inner_w = (avail_w - 16.0).max(320.0);
+        let col_cpu = 58.0;
+        let col_ram = 76.0;
+        let col_disk = 74.0;
+        let col_name = (inner_w - col_cpu - col_ram - col_disk - 18.0).max(110.0);
 
         // Table Header
         egui::Frame::none()
@@ -1462,7 +1464,9 @@ impl PulseGlassApp {
             .rounding(Rounding::same(6.0))
             .inner_margin(egui::Margin::symmetric(8.0, 5.0))
             .show(ui, |ui| {
+                ui.set_width(inner_w);
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
                     ui.add_sized([col_name, 16.0], egui::Label::new(RichText::new(tr.t("Uygulama", "Process")).strong().size(11.0).color(secondary)).truncate());
                     ui.add_sized([col_cpu, 16.0], egui::Label::new(RichText::new("CPU").strong().size(11.0).color(secondary)));
                     ui.add_sized([col_ram, 16.0], egui::Label::new(RichText::new("RAM").strong().size(11.0).color(secondary)));
@@ -1489,7 +1493,9 @@ impl PulseGlassApp {
                 .rounding(Rounding::same(4.0))
                 .inner_margin(egui::Margin::symmetric(8.0, 4.0))
                 .show(ui, |ui| {
+                    ui.set_width(inner_w);
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
                         ui.add_sized(
                             [col_name, 16.0],
                             egui::Label::new(RichText::new(&name).size(11.0).color(Color32::from_rgb(240, 232, 230)))
