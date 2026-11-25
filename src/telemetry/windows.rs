@@ -4,7 +4,6 @@ use crate::models::{GpuInfo, PhysicalDiskInfo, PowerInfo};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_void, OsStr};
 use std::os::windows::ffi::OsStrExt;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -875,30 +874,123 @@ pub fn poll_power_info(emi: &mut EmiPowerReader, gpu_watts: Option<f32>, gpu_lim
 }
 
 // ============================================================================
-// 4. CPU TEMPERATURE FALLBACK (ACPI Thermal Zone via PowerShell/WMI cached)
+// 4. CPU TEMPERATURE: Native Windows PDH (pdh.dll) — ZERO PowerShell / ZERO console flash!
 // ============================================================================
 
-pub fn read_acpi_cpu_temp() -> Option<f32> {
-    let out = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            "(Get-CimInstance -Namespace root/WMI -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty CurrentTemperature)",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+#[repr(C)]
+struct PdhFmtCounterValue {
+    c_status: u32,
+    double_value: f64,
+}
+
+type FnPdhOpenQueryW = unsafe extern "system" fn(*const u16, usize, *mut *mut c_void) -> i32;
+type FnPdhAddEnglishCounterW =
+    unsafe extern "system" fn(*mut c_void, *const u16, usize, *mut *mut c_void) -> i32;
+type FnPdhCollectQueryData = unsafe extern "system" fn(*mut c_void) -> i32;
+type FnPdhGetFormattedCounterValue =
+    unsafe extern "system" fn(*mut c_void, u32, *mut u32, *mut PdhFmtCounterValue) -> i32;
+type FnPdhCloseQuery = unsafe extern "system" fn(*mut c_void) -> i32;
+
+const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
+
+pub struct PdhThermalReader {
+    query: *mut c_void,
+    counter: *mut c_void,
+    collect: Option<FnPdhCollectQueryData>,
+    get_val: Option<FnPdhGetFormattedCounterValue>,
+    close: Option<FnPdhCloseQuery>,
+}
+
+unsafe impl Send for PdhThermalReader {}
+
+impl PdhThermalReader {
+    pub fn try_new() -> Option<Self> {
+        let w = to_wide("pdh.dll");
+        let module = unsafe { LoadLibraryW(w.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        macro_rules! load_pdh {
+            ($name:literal, $ty:ty) => {{
+                let p = unsafe { GetProcAddress(module, concat!($name, "\0").as_ptr()) };
+                p.map(|f| unsafe { std::mem::transmute::<_, $ty>(f) })
+            }};
+        }
+        let open: FnPdhOpenQueryW = load_pdh!("PdhOpenQueryW", FnPdhOpenQueryW)?;
+        let add: FnPdhAddEnglishCounterW =
+            load_pdh!("PdhAddEnglishCounterW", FnPdhAddEnglishCounterW)?;
+        let collect = load_pdh!("PdhCollectQueryData", FnPdhCollectQueryData);
+        let get_val = load_pdh!("PdhGetFormattedCounterValue", FnPdhGetFormattedCounterValue);
+        let close = load_pdh!("PdhCloseQuery", FnPdhCloseQuery);
+
+        let mut query: *mut c_void = std::ptr::null_mut();
+        if unsafe { open(std::ptr::null(), 0, &mut query) } != 0 || query.is_null() {
+            return None;
+        }
+
+        // Try standard ACPI thermal zone counter path
+        let paths = [
+            r"\Thermal Zone Information(\_TZ.TZ01)\Temperature",
+            r"\Thermal Zone Information(\_TZ.TZ00)\Temperature",
+            r"\Thermal Zone Information(\_TZ.THRM)\Temperature",
+            r"\Thermal Zone Information(*)\Temperature",
+        ];
+        let mut counter: *mut c_void = std::ptr::null_mut();
+        let mut added = false;
+        for p in &paths {
+            let pw = to_wide(p);
+            if unsafe { add(query, pw.as_ptr(), 0, &mut counter) } == 0 && !counter.is_null() {
+                added = true;
+                break;
+            }
+        }
+        if !added {
+            if let Some(c) = close {
+                unsafe { c(query) };
+            }
+            return None;
+        }
+        if let Some(c) = collect {
+            unsafe { c(query) };
+        }
+        Some(Self {
+            query,
+            counter,
+            collect,
+            get_val,
+            close,
+        })
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let tenths_k: f32 = s.parse().ok()?;
-    let c = (tenths_k / 10.0) - 273.15;
-    if c > 15.0 && c < 115.0 {
-        Some(c.round())
-    } else {
+
+    pub fn read_temp_c(&self) -> Option<f32> {
+        let collect = self.collect?;
+        let get_val = self.get_val?;
+        if unsafe { collect(self.query) } != 0 {
+            return None;
+        }
+        let mut val = PdhFmtCounterValue {
+            c_status: 0,
+            double_value: 0.0,
+        };
+        let mut ctype = 0u32;
+        if unsafe { get_val(self.counter, PDH_FMT_DOUBLE, &mut ctype, &mut val) } == 0
+            && val.c_status == 0
+        {
+            let k = val.double_value as f32;
+            let c = if k > 200.0 { k - 273.15 } else { k };
+            if c > 15.0 && c < 115.0 {
+                return Some(c.round());
+            }
+        }
         None
+    }
+}
+
+impl Drop for PdhThermalReader {
+    fn drop(&mut self) {
+        if let Some(c) = self.close {
+            unsafe { c(self.query) };
+        }
     }
 }
 
