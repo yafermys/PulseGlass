@@ -79,6 +79,9 @@ pub struct PulseGlassApp {
     screenshot_out: Option<String>,
     screenshot_requested: bool,
     frame_count: u32,
+
+    // Native Win32 manual window drag state: (hwnd, start_cursor_x, start_cursor_y, start_win_x, start_win_y)
+    win_drag: Option<(isize, i32, i32, i32, i32)>,
 }
 
 impl PulseGlassApp {
@@ -121,6 +124,84 @@ impl PulseGlassApp {
             },
             screenshot_requested: false,
             frame_count: 0,
+            win_drag: None,
+        }
+    }
+
+    fn begin_window_drag(&mut self, ctx: &egui::Context) {
+        if self.ghost_mode {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{POINT, RECT};
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                FindWindowW, GetCursorPos, GetWindowRect,
+            };
+            let title: Vec<u16> = "PulseGlass Hardware Monitor\0".encode_utf16().collect();
+            unsafe {
+                let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                if !hwnd.is_null() {
+                    let mut pt = POINT { x: 0, y: 0 };
+                    let mut rc = RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    };
+                    if GetCursorPos(&mut pt) != 0 && GetWindowRect(hwnd, &mut rc) != 0 {
+                        self.win_drag = Some((hwnd as isize, pt.x, pt.y, rc.left, rc.top));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            }
+        }
+        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+    }
+
+    fn tick_window_drag(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        if let Some((hwnd_raw, sx, sy, wx, wy)) = self.win_drag {
+            use windows_sys::Win32::Foundation::POINT;
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+                GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON,
+            };
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetCursorPos, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+            };
+            unsafe {
+                let l_down = (GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000) != 0;
+                let m_down = (GetAsyncKeyState(VK_MBUTTON as i32) as u16 & 0x8000) != 0;
+                if l_down || m_down {
+                    let mut pt = POINT { x: 0, y: 0 };
+                    if GetCursorPos(&mut pt) != 0 {
+                        let nx = wx + (pt.x - sx);
+                        let ny = wy + (pt.y - sy);
+                        let _ = SetWindowPos(
+                            hwnd_raw as _,
+                            std::ptr::null_mut(),
+                            nx,
+                            ny,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                        if self.mode == ViewMode::CompactWidget || self.mode == ViewMode::SummaryOsd {
+                            let ppp = ctx.pixels_per_point().max(1.0);
+                            self.settings.pos_x = Some(nx as f32 / ppp);
+                            self.settings.pos_y = Some(ny as f32 / ppp);
+                        }
+                    }
+                    ctx.request_repaint();
+                } else {
+                    self.win_drag = None;
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = ctx;
         }
     }
 
@@ -486,12 +567,15 @@ impl eframe::App for PulseGlassApp {
         let primary = self.primary_color();
         let secondary = self.secondary_color();
 
+        // Continue active Win32 drag smoothly every frame until mouse button released
+        self.tick_window_drag(ctx);
+
         let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
         let middle_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
 
         // Middle-click drag works from ANYWHERE on the window
         if middle_pressed && !self.ghost_mode {
-            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            self.begin_window_drag(ctx);
         }
 
         // 4. PURE SUMMARY OSD MODE — ONLY selected values, ZERO chrome, ALWAYS transparent, instant left-drag!
@@ -507,7 +591,7 @@ impl eframe::App for PulseGlassApp {
                         13.5,
                     );
                     if !self.ghost_mode && (resp.hovered() && primary_pressed) {
-                        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                        self.begin_window_drag(ctx);
                     }
                     let target = Vec2::new((rect.width() + 12.0).max(140.0), (rect.height() + 6.0).max(26.0));
                     if (target - self.last_osd_size).length() > 3.0 {
@@ -686,7 +770,7 @@ impl eframe::App for PulseGlassApp {
                 }
 
                 if wants_drag && !self.ghost_mode {
-                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                    self.begin_window_drag(ctx);
                 }
             });
     }
@@ -1047,7 +1131,7 @@ impl PulseGlassApp {
 
         ui.add_space(8.0);
 
-        // Power & Wattage Card
+        // Power & Wattage Card (GPU & Total Device only)
         glass_card(ui, secondary, |ui| {
             ui.label(
                 RichText::new(tr.t("Güç Tüketimi (Watt)", "Power Consumption (Watts)"))
@@ -1056,21 +1140,17 @@ impl PulseGlassApp {
                     .color(secondary),
             );
             ui.add_space(4.0);
-            ui.columns(3, |cols| {
+            ui.columns(2, |cols| {
                 cols[0].vertical(|ui| {
                     ui.label(RichText::new(tr.t("Ekran Kartı (GPU)", "GPU Power")).size(10.5).color(Color32::GRAY));
-                    ui.label(RichText::new(snap.gpu.power_text()).strong().size(14.0).color(primary));
+                    ui.label(RichText::new(snap.gpu.power_text()).strong().size(14.5).color(primary));
                 });
                 cols[1].vertical(|ui| {
-                    ui.label(RichText::new(tr.t("İşlemci (CPU)", "CPU Package")).size(10.5).color(Color32::GRAY));
-                    ui.label(RichText::new(snap.power.cpu_text()).strong().size(14.0).color(secondary));
-                });
-                cols[2].vertical(|ui| {
                     ui.label(RichText::new(tr.t("Genel Cihaz", "Total Device")).size(10.5).color(Color32::GRAY));
                     ui.label(
                         RichText::new(snap.power.device_text())
                             .strong()
-                            .size(14.0)
+                            .size(14.5)
                             .color(Color32::from_rgb(255, 241, 235)),
                     );
                 });
@@ -1138,7 +1218,7 @@ impl PulseGlassApp {
             ui.label(RichText::new(&snap.cpu.name).strong().size(13.0).color(Color32::from_rgb(255, 241, 235)));
             ui.label(
                 RichText::new(format!(
-                    "{}: {} / {}   |   {}: {:.2} GHz   |   {}: {:.1}%   |   {}: {}   |   {}: {}",
+                    "{}: {} / {}   |   {}: {:.2} GHz   |   {}: {:.1}%   |   {}: {}",
                     tr.t("Çekirdek", "Cores"),
                     snap.cpu.physical_cores,
                     snap.cpu.logical_processors,
@@ -1147,9 +1227,7 @@ impl PulseGlassApp {
                     tr.t("Kullanım", "Usage"),
                     snap.cpu.usage_percent,
                     tr.t("Sıcaklık", "Temp"),
-                    snap.cpu.temp_text(),
-                    tr.t("Güç", "Power"),
-                    snap.power.cpu_text()
+                    snap.cpu.temp_text()
                 ))
                 .size(11.0)
                 .color(Color32::from_rgb(203, 213, 225)),
@@ -1226,11 +1304,9 @@ impl PulseGlassApp {
             ui.label(RichText::new(tr.t("GÜÇ & WATT DEĞERLERİ", "POWER & WATTAGE")).strong().size(11.0).color(secondary));
             ui.label(
                 RichText::new(format!(
-                    "{}: {}   |   {}: {}   |   {}: {}\n{}: {}   |   {}: {}",
+                    "{}: {}   |   {}: {}\n{}: {}   |   {}: {}",
                     tr.t("Ekran Kartı (GPU)", "GPU"),
                     snap.gpu.power_text(),
-                    tr.t("İşlemci (CPU)", "CPU"),
-                    snap.power.cpu_text(),
                     tr.t("Genel Cihaz", "Total Device"),
                     snap.power.device_text(),
                     tr.t("Kaynak", "Source"),
