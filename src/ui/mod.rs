@@ -136,11 +136,11 @@ impl PulseGlassApp {
     }
 
     fn bg_base_color(&self) -> Color32 {
-        parse_hex_color(&self.settings.bg_hex, Color32::from_rgb(18, 15, 24))
+        parse_hex_color(&self.settings.bg_hex, Color32::from_rgb(20, 14, 22))
     }
 
     /// Independent opacities:
-    /// - Summary OSD: ALWAYS completely transparent (0 alpha), never affected by Widget/Window sliders
+    /// - Summary OSD: ALWAYS completely transparent (0 alpha)
     /// - Compact/Detailed Widget: uses settings.widget_opacity ONLY
     /// - Full Window: uses settings.window_opacity ONLY
     fn active_bg_color(&self) -> Color32 {
@@ -148,12 +148,12 @@ impl PulseGlassApp {
             ViewMode::SummaryOsd => Color32::TRANSPARENT,
             ViewMode::FullWindow => {
                 let base = self.bg_base_color();
-                let a = (self.settings.window_opacity.clamp(0.25, 1.0) * 255.0) as u8;
+                let a = (self.settings.window_opacity.clamp(0.35, 1.0) * 255.0) as u8;
                 Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a)
             }
             ViewMode::CompactWidget | ViewMode::DetailedWidget => {
                 let base = self.bg_base_color();
-                let a = (self.settings.widget_opacity.clamp(0.20, 1.0) * 255.0) as u8;
+                let a = (self.settings.widget_opacity.clamp(0.25, 1.0) * 255.0) as u8;
                 Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a)
             }
         }
@@ -177,33 +177,52 @@ impl PulseGlassApp {
 
     fn apply_window_geometry(&self, ctx: &egui::Context) {
         let s = self.settings.ui_scale.clamp(0.85, 1.35);
-        ctx.set_zoom_factor(s);
+        if (s - 1.0).abs() > 0.01 {
+            ctx.set_zoom_factor(s);
+        } else {
+            ctx.set_zoom_factor(1.0);
+        }
+
         match self.mode {
             ViewMode::SummaryOsd => {
+                ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(560.0, 32.0)));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(520.0, 32.0)));
             }
             ViewMode::CompactWidget => {
+                ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
                 let lvl = if self.settings.topmost {
                     egui::WindowLevel::AlwaysOnTop
                 } else {
                     egui::WindowLevel::Normal
                 };
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(lvl));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(480.0, 264.0)));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(480.0, 294.0)));
+                if let (Some(x), Some(y)) = (self.settings.pos_x, self.settings.pos_y) {
+                    if x > -5000.0 && y > -5000.0 {
+                        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
+                    }
+                }
             }
             ViewMode::DetailedWidget => {
+                ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
                 let lvl = if self.settings.topmost {
                     egui::WindowLevel::AlwaysOnTop
                 } else {
                     egui::WindowLevel::Normal
                 };
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(lvl));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(620.0, 560.0)));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(660.0, 560.0)));
             }
             ViewMode::FullWindow => {
+                ctx.send_viewport_cmd(ViewportCommand::Resizable(true));
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(900.0, 640.0)));
+                if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
+                    let x = ((mon.x - 900.0) * 0.5).max(16.0);
+                    let y = ((mon.y - 640.0) * 0.5).max(16.0);
+                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
+                }
             }
         }
     }
@@ -231,6 +250,7 @@ impl PulseGlassApp {
             .ok();
     }
 
+    /// Restores exact original PulseGlass summary format: CPU 28% (52°C) • GPU 0% (41°C) • RAM 78% • SSD 56°C • FPS: --
     fn build_summary_line(&self, snap: &HardwareSnapshot, tr: &I18n) -> String {
         let mut parts = Vec::new();
         if self.settings.sum_cpu_pct || self.settings.sum_cpu_temp {
@@ -239,7 +259,7 @@ impl PulseGlassApp {
                 s.push_str(&format!(" {:.0}%", snap.cpu.usage_percent));
             }
             if self.settings.sum_cpu_temp {
-                s.push_str(&format!(" {}", snap.cpu.temp_text()));
+                s.push_str(&format!(" ({})", snap.cpu.temp_text()));
             }
             parts.push(s);
         }
@@ -249,7 +269,7 @@ impl PulseGlassApp {
                 s.push_str(&format!(" {:.0}%", snap.gpu.usage_percent));
             }
             if self.settings.sum_gpu_temp {
-                s.push_str(&format!(" {}", snap.gpu.temp_text()));
+                s.push_str(&format!(" ({})", snap.gpu.temp_text()));
             }
             parts.push(s);
         }
@@ -283,30 +303,61 @@ impl PulseGlassApp {
     }
 }
 
-fn header_btn(ui: &mut egui::Ui, text: &str, active: bool, primary: Color32) -> egui::Response {
+fn header_btn(ui: &mut egui::Ui, text: &str, active: bool, primary: Color32, secondary: Color32) -> egui::Response {
     let fill = if active {
-        Color32::from_rgba_unmultiplied(primary.r(), primary.g(), primary.b(), 145)
+        Color32::from_rgb(68, 30, 44)
     } else {
-        Color32::from_rgba_unmultiplied(40, 32, 52, 185)
+        Color32::from_rgb(40, 32, 44)
     };
     let txt_col = if active {
-        Color32::WHITE
+        secondary
     } else {
-        Color32::from_rgb(245, 224, 220)
+        Color32::from_rgb(241, 224, 222)
+    };
+    let stroke = if active {
+        Stroke::new(1.0_f32, primary)
+    } else {
+        Stroke::new(0.8_f32, Color32::from_rgb(62, 50, 66))
     };
     ui.add(
         egui::Button::new(RichText::new(text).size(10.5).color(txt_col))
             .fill(fill)
+            .stroke(stroke)
+            .rounding(Rounding::same(7.0))
+            .min_size(Vec2::new(22.0, 22.0)),
+    )
+}
+
+fn tab_pill_btn(ui: &mut egui::Ui, text: &str, selected: bool, secondary: Color32) -> egui::Response {
+    let fill = if selected {
+        Color32::from_rgb(66, 28, 42)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let txt_col = if selected {
+        secondary
+    } else {
+        Color32::from_rgb(160, 174, 192)
+    };
+    ui.add(
+        egui::Button::new(RichText::new(text).size(11.5).strong().color(txt_col))
+            .fill(fill)
+            .stroke(Stroke::NONE)
+            .rounding(Rounding::same(8.0))
+            .min_size(Vec2::new(56.0, 26.0)),
+    )
+}
+
+fn shortcut_pill_btn(ui: &mut egui::Ui, text: &str, secondary: Color32) -> egui::Response {
+    ui.add_sized(
+        [ui.available_width(), 30.0],
+        egui::Button::new(RichText::new(text).size(11.5).strong().color(Color32::from_rgb(248, 236, 232)))
+            .fill(Color32::from_rgb(38, 30, 42))
             .stroke(Stroke::new(
-                0.9_f32,
-                if active {
-                    primary
-                } else {
-                    Color32::from_rgba_unmultiplied(255, 176, 133, 60)
-                },
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(secondary.r(), secondary.g(), secondary.b(), 55),
             ))
-            .rounding(Rounding::same(6.0))
-            .min_size(Vec2::new(22.0, 21.0)),
+            .rounding(Rounding::same(9.0)),
     )
 }
 
@@ -356,23 +407,39 @@ impl eframe::App for PulseGlassApp {
             }
         }
 
-        // 1. Default top-right positioning on first launch
+        // 1. Default top-right positioning on first launch (validating saved coords so minimized coords never trap off-screen)
         if !self.positioned_initial {
             self.positioned_initial = true;
-            if let (Some(x), Some(y)) = (self.settings.pos_x, self.settings.pos_y) {
-                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
-            } else if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
-                let x = (mon.x - 480.0 - 16.0).max(16.0);
+            let mon = ctx.input(|i| i.viewport().monitor_size);
+            let valid_saved = match (self.settings.pos_x, self.settings.pos_y, mon) {
+                (Some(x), Some(y), Some(m)) => {
+                    x >= -100.0 && x <= m.x - 80.0 && y >= 0.0 && y <= m.y - 60.0
+                }
+                (Some(x), Some(y), None) => x > -5000.0 && y > -5000.0,
+                _ => false,
+            };
+            if valid_saved {
+                if let (Some(x), Some(y)) = (self.settings.pos_x, self.settings.pos_y) {
+                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
+                }
+            } else if let Some(m) = mon {
+                let x = (m.x - 480.0 - 16.0).max(16.0);
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, 16.0)));
+                self.settings.pos_x = Some(x);
+                self.settings.pos_y = Some(16.0);
             }
-            self.apply_window_geometry(ctx);
+            if (self.settings.ui_scale - 1.0).abs() > 0.01 {
+                ctx.set_zoom_factor(self.settings.ui_scale.clamp(0.85, 1.35));
+            }
         }
 
-        // Save current position lazily
-        if self.mode != ViewMode::FullWindow {
+        // Save current position only when on-screen and not minimized (-32000 on Windows)
+        if self.mode == ViewMode::CompactWidget || self.mode == ViewMode::SummaryOsd {
             if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-                self.settings.pos_x = Some(rect.min.x);
-                self.settings.pos_y = Some(rect.min.y);
+                if rect.min.x > -5000.0 && rect.min.y > -5000.0 {
+                    self.settings.pos_x = Some(rect.min.x);
+                    self.settings.pos_y = Some(rect.min.y);
+                }
             }
         }
 
@@ -419,24 +486,31 @@ impl eframe::App for PulseGlassApp {
         let primary = self.primary_color();
         let secondary = self.secondary_color();
 
-        // 4. PURE SUMMARY OSD MODE — ONLY selected values, ZERO chrome, ALWAYS transparent!
+        let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
+        let middle_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+
+        // Middle-click drag works from ANYWHERE on the window
+        if middle_pressed && !self.ghost_mode {
+            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+        }
+
+        // 4. PURE SUMMARY OSD MODE — ONLY selected values, ZERO chrome, ALWAYS transparent, instant left-drag!
         if self.mode == ViewMode::SummaryOsd {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
                 .show(ctx, |ui| {
                     let line = self.build_summary_line(&snap, &tr);
-                    let rect = draw_shadowed_osd_text(
+                    let (rect, resp) = draw_shadowed_osd_text(
                         ui,
                         &line,
                         Color32::from_rgb(255, 228, 214),
                         13.5,
                     );
-                    let resp = ui.interact(rect, egui::Id::new("osd_drag"), egui::Sense::drag());
-                    if resp.drag_started() && !self.ghost_mode {
+                    if !self.ghost_mode && (resp.hovered() && primary_pressed) {
                         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                     }
-                    let target = Vec2::new((rect.width() + 10.0).max(120.0), (rect.height() + 6.0).max(26.0));
-                    if (target - self.last_osd_size).length() > 2.5 {
+                    let target = Vec2::new((rect.width() + 12.0).max(140.0), (rect.height() + 6.0).max(26.0));
+                    if (target - self.last_osd_size).length() > 3.0 {
                         self.last_osd_size = target;
                         ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
                     }
@@ -449,155 +523,171 @@ impl eframe::App for PulseGlassApp {
         let border_color = if !snap.alerts.is_empty() {
             primary
         } else {
-            Color32::from_rgba_unmultiplied(secondary.r(), secondary.g(), secondary.b(), 95)
+            Color32::from_rgba_unmultiplied(secondary.r(), secondary.g(), secondary.b(), 82)
         };
 
         let frame = egui::Frame::none()
             .fill(bg_fill)
-            .stroke(Stroke::new(1.2_f32, border_color))
+            .stroke(Stroke::new(1.1_f32, border_color))
             .rounding(Rounding::same(if self.mode == ViewMode::FullWindow {
                 10.0
             } else {
                 16.0
             }))
             .outer_margin(egui::Margin::same(4.0))
-            .inner_margin(egui::Margin::symmetric(13.0, 10.0));
+            .inner_margin(egui::Margin::symmetric(14.0, 11.0));
 
         egui::CentralPanel::default()
             .frame(frame)
             .show(ctx, |ui| {
-                    // --- HEADER BAR (Draggable ONLY on title/empty space, NEVER covering buttons!) ---
-                    let mut start_drag = false;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        let dot_color = if !snap.alerts.is_empty() {
-                            Color32::from_rgb(239, 68, 68)
-                        } else {
-                            primary
-                        };
-                        let (dot_rect, dot_resp) =
-                            ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::drag());
-                        ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
-                        if dot_resp.drag_started() {
-                            start_drag = true;
-                        }
-
-                        let title_resp = ui.add(
-                            egui::Label::new(
-                                RichText::new("PulseGlass")
-                                    .strong()
-                                    .size(13.0)
-                                    .color(Color32::from_rgb(255, 241, 235)),
-                            )
-                            .sense(egui::Sense::drag()),
-                        );
-                        if title_resp.drag_started() {
-                            start_drag = true;
-                        }
-
-                        if let Some(alert) = snap.alerts.first() {
-                            ui.label(
-                                RichText::new(format!("! {}", alert))
-                                    .size(10.0)
-                                    .strong()
-                                    .color(primary),
-                            );
-                        } else if self.ghost_mode {
-                            ui.label(
-                                RichText::new(tr.t("Geçirgen", "Ghost"))
-                                    .size(10.0)
-                                    .color(secondary),
-                            );
-                        }
-
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                if header_btn(ui, "×", false, primary)
-                                    .on_hover_text(tr.t("Kapat", "Close"))
-                                    .clicked()
-                                {
-                                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                                }
-                                if header_btn(ui, "—", false, primary)
-                                    .on_hover_text(tr.t("Küçült", "Minimize"))
-                                    .clicked()
-                                {
-                                    ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-                                }
-                                let det_lbl = if self.mode == ViewMode::DetailedWidget {
-                                    tr.t("Widget", "Widget")
-                                } else {
-                                    tr.t("Detay", "Detail")
-                                };
-                                if header_btn(ui, det_lbl, self.mode == ViewMode::DetailedWidget, primary).clicked() {
-                                    self.mode = if self.mode == ViewMode::DetailedWidget {
-                                        ViewMode::CompactWidget
-                                    } else {
-                                        ViewMode::DetailedWidget
-                                    };
-                                    self.apply_window_geometry(ctx);
-                                }
-                                let win_lbl = if self.mode == ViewMode::FullWindow {
-                                    tr.t("Widget", "Widget")
-                                } else {
-                                    tr.t("Pencere", "Window")
-                                };
-                                if header_btn(ui, win_lbl, self.mode == ViewMode::FullWindow, primary).clicked() {
-                                    self.mode = if self.mode == ViewMode::FullWindow {
-                                        ViewMode::CompactWidget
-                                    } else {
-                                        ViewMode::FullWindow
-                                    };
-                                    self.apply_window_geometry(ctx);
-                                }
-                                if header_btn(ui, tr.t("Özet", "OSD"), false, primary)
-                                    .on_hover_text(tr.t("Özet Modu (Ctrl+Enter)", "Summary OSD (Ctrl+Enter)"))
-                                    .clicked()
-                                {
-                                    self.toggle_summary(ctx);
-                                }
-                                if header_btn(ui, tr.t("Üstte", "Pin"), self.settings.topmost, primary)
-                                    .on_hover_text(tr.t("Her zaman üstte", "Always on top"))
-                                    .clicked()
-                                {
-                                    self.settings.topmost = !self.settings.topmost;
-                                    self.apply_window_geometry(ctx);
-                                }
-                                if header_btn(ui, tr.t("Hayalet", "Ghost"), self.ghost_mode, primary)
-                                    .on_hover_text(tr.t("Geçirgen Mod (Shift+Enter)", "Ghost Click-Through (Shift+Enter)"))
-                                    .clicked()
-                                {
-                                    self.toggle_ghost(ctx);
-                                }
-                                // Remaining empty space between title and buttons is draggable
-                                let rem = ui.available_size();
-                                if rem.x > 4.0 {
-                                    let (_, sp) = ui.allocate_exact_size(Vec2::new(rem.x, 20.0), egui::Sense::drag());
-                                    if sp.drag_started() {
-                                        start_drag = true;
-                                    }
-                                }
-                            },
-                        );
-                    });
-
-                    if start_drag || ctx.input(|i| i.pointer.middle_down()) {
-                        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                // --- HEADER BAR (Instant drag on primary_pressed over title/dot/spacer, buttons 100% clickable!) ---
+                let mut wants_drag = false;
+                let mut btn_hovered = false;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    let dot_color = if !snap.alerts.is_empty() {
+                        Color32::from_rgb(239, 68, 68)
+                    } else {
+                        primary
+                    };
+                    let (dot_rect, dot_resp) =
+                        ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::click_and_drag());
+                    ui.painter().circle_filled(dot_rect.center(), 4.2, dot_color);
+                    if dot_resp.hovered() && primary_pressed {
+                        wants_drag = true;
                     }
 
-                    ui.add_space(6.0);
-
-                    match self.mode {
-                        ViewMode::CompactWidget => {
-                            self.render_compact_widget(ui, &snap, &tr, primary, secondary);
-                        }
-                        ViewMode::DetailedWidget | ViewMode::FullWindow => {
-                            self.render_detailed_dashboard(ui, ctx, &snap, &tr, primary, secondary);
-                        }
-                        ViewMode::SummaryOsd => {}
+                    let title_resp = ui.add(
+                        egui::Label::new(
+                            RichText::new("PulseGlass")
+                                .strong()
+                                .size(13.5)
+                                .color(Color32::from_rgb(255, 241, 235)),
+                        )
+                        .sense(egui::Sense::click_and_drag()),
+                    );
+                    if title_resp.hovered() && primary_pressed {
+                        wants_drag = true;
                     }
+
+                    if let Some(alert) = snap.alerts.first() {
+                        ui.label(
+                            RichText::new(format!("! {}", alert))
+                                .size(10.0)
+                                .strong()
+                                .color(primary),
+                        );
+                    } else if self.ghost_mode {
+                        ui.label(
+                            RichText::new(tr.t("Geçirgen", "Ghost"))
+                                .size(10.0)
+                                .color(secondary),
+                        );
+                    }
+
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let r = header_btn(ui, "×", false, primary, secondary)
+                                .on_hover_text(tr.t("Kapat", "Close"));
+                            btn_hovered |= r.hovered();
+                            if r.clicked() {
+                                ctx.send_viewport_cmd(ViewportCommand::Close);
+                            }
+
+                            let r = header_btn(ui, "—", false, primary, secondary)
+                                .on_hover_text(tr.t("Küçült", "Minimize"));
+                            btn_hovered |= r.hovered();
+                            if r.clicked() {
+                                ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                            }
+
+                            let det_lbl = if self.mode == ViewMode::DetailedWidget {
+                                tr.t("Kompakt", "Compact")
+                            } else {
+                                tr.t("Detay", "Detail")
+                            };
+                            let r = header_btn(ui, det_lbl, self.mode == ViewMode::DetailedWidget, primary, secondary);
+                            btn_hovered |= r.hovered();
+                            if r.clicked() {
+                                self.mode = if self.mode == ViewMode::DetailedWidget {
+                                    ViewMode::CompactWidget
+                                } else {
+                                    ViewMode::DetailedWidget
+                                };
+                                self.apply_window_geometry(ctx);
+                            }
+
+                            let win_lbl = if self.mode == ViewMode::FullWindow {
+                                tr.t("Widget", "Widget")
+                            } else {
+                                tr.t("Pencere", "Window")
+                            };
+                            let r = header_btn(ui, win_lbl, self.mode == ViewMode::FullWindow, primary, secondary);
+                            btn_hovered |= r.hovered();
+                            if r.clicked() {
+                                self.mode = if self.mode == ViewMode::FullWindow {
+                                    ViewMode::CompactWidget
+                                } else {
+                                    ViewMode::FullWindow
+                                };
+                                self.apply_window_geometry(ctx);
+                            }
+
+                            let r = header_btn(ui, tr.t("Özet", "Summary"), false, primary, secondary)
+                                .on_hover_text(tr.t("Özet Modu (Ctrl+Enter)", "Summary OSD (Ctrl+Enter)"));
+                            btn_hovered |= r.hovered();
+                            if r.clicked() {
+                                self.toggle_summary(ctx);
+                            }
+
+                            let r = header_btn(ui, tr.t("Üstte", "Pin"), self.settings.topmost, primary, secondary)
+                                .on_hover_text(tr.t("Her zaman üstte", "Always on top"));
+                            btn_hovered |= r.hovered();
+                            if r.clicked() {
+                                self.settings.topmost = !self.settings.topmost;
+                                self.apply_window_geometry(ctx);
+                            }
+
+                            let r = header_btn(ui, tr.t("Hayalet", "Ghost"), self.ghost_mode, primary, secondary)
+                                .on_hover_text(tr.t("Geçirgen Mod (Shift+Enter)", "Ghost Click-Through (Shift+Enter)"));
+                            btn_hovered |= r.hovered();
+                            if r.clicked() {
+                                self.toggle_ghost(ctx);
+                            }
+
+                            // Empty spacer between title and buttons is also immediately draggable
+                            let rem = ui.available_size();
+                            if rem.x > 4.0 {
+                                let (_, sp) = ui.allocate_exact_size(Vec2::new(rem.x, 22.0), egui::Sense::click_and_drag());
+                                if sp.hovered() && primary_pressed {
+                                    wants_drag = true;
+                                }
+                            }
+                        },
+                    );
+                });
+
+                ui.add_space(7.0);
+
+                match self.mode {
+                    ViewMode::CompactWidget => {
+                        let shortcut_hovered =
+                            self.render_compact_widget(ui, ctx, &snap, &tr, primary, secondary);
+                        if !self.ghost_mode && primary_pressed && !btn_hovered && !shortcut_hovered {
+                            wants_drag = true;
+                        }
+                    }
+                    ViewMode::DetailedWidget | ViewMode::FullWindow => {
+                        self.render_detailed_dashboard(ui, ctx, &snap, &tr, primary, secondary);
+                    }
+                    ViewMode::SummaryOsd => {}
+                }
+
+                if wants_drag && !self.ghost_mode {
+                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                }
             });
     }
 }
@@ -606,11 +696,13 @@ impl PulseGlassApp {
     fn render_compact_widget(
         &mut self,
         ui: &mut egui::Ui,
+        ctx: &egui::Context,
         snap: &HardwareSnapshot,
         tr: &I18n,
         primary: Color32,
         secondary: Color32,
-    ) {
+    ) -> bool {
+        // 4 Circular Gauges (matching original compact-widget.png)
         ui.columns(4, |cols| {
             cols[0].vertical_centered(|ui| {
                 draw_circular_gauge(
@@ -624,10 +716,10 @@ impl PulseGlassApp {
                     self.settings.cpu_use_thresh,
                 );
                 ui.add_space(2.0);
-                ui.label(RichText::new("CPU").strong().size(11.0).color(Color32::from_rgb(255, 228, 214)));
+                ui.label(RichText::new("CPU").strong().size(11.5).color(Color32::from_rgb(255, 232, 224)));
                 ui.label(
                     RichText::new(format!("{:.2} GHz", snap.cpu.current_clock_ghz))
-                        .size(10.0)
+                        .size(10.5)
                         .color(secondary),
                 );
             });
@@ -644,10 +736,10 @@ impl PulseGlassApp {
                     85.0,
                 );
                 ui.add_space(2.0);
-                ui.label(RichText::new(tr.t("Harici GPU", "dGPU")).strong().size(11.0).color(Color32::from_rgb(255, 228, 214)));
+                ui.label(RichText::new(tr.t("Harici GPU", "Discrete GPU")).strong().size(11.0).color(Color32::from_rgb(255, 232, 224)));
                 ui.label(
                     RichText::new(snap.gpu.vram_text())
-                        .size(10.0)
+                        .size(10.5)
                         .color(secondary),
                 );
             });
@@ -669,18 +761,18 @@ impl PulseGlassApp {
                     85.0,
                 );
                 ui.add_space(2.0);
-                ui.label(RichText::new(tr.t("Dahili GPU", "iGPU")).strong().size(11.0).color(Color32::from_rgb(255, 228, 214)));
+                ui.label(RichText::new(tr.t("Dahili GPU", "Integrated GPU")).strong().size(11.0).color(Color32::from_rgb(255, 232, 224)));
                 let sub = if snap.igpu.is_available {
                     format!("{:.1} GB", snap.igpu.total_vram_gb.max(snap.igpu.used_vram_gb))
                 } else {
                     tr.t("Yok", "None").to_string()
                 };
-                ui.label(RichText::new(sub).size(10.0).color(secondary));
+                ui.label(RichText::new(sub).size(10.5).color(secondary));
             });
 
             cols[3].vertical_centered(|ui| {
                 let ram_sub = if snap.ram.used_gb >= 1.0 {
-                    format!("{:.1} GB", snap.ram.used_gb)
+                    format!("{:.0} GB", snap.ram.used_gb.round())
                 } else {
                     format!("{:.0} MB", snap.ram.used_gb * 1024.0)
                 };
@@ -692,13 +784,13 @@ impl PulseGlassApp {
                     &ram_sub,
                     secondary,
                     primary,
-                    self.settings.ram_use_thresh,
+                    75.0_f32.min(self.settings.ram_use_thresh),
                 );
                 ui.add_space(2.0);
-                ui.label(RichText::new("RAM").strong().size(11.0).color(Color32::from_rgb(255, 228, 214)));
+                ui.label(RichText::new("RAM").strong().size(11.5).color(Color32::from_rgb(255, 232, 224)));
                 ui.label(
-                    RichText::new(format!("{:.1}/{:.0} GB", snap.ram.used_gb, snap.ram.installed_gb))
-                        .size(10.0)
+                    RichText::new(format!("{:.1} / {:.0} GB", snap.ram.used_gb, snap.ram.installed_gb))
+                        .size(10.5)
                         .color(secondary),
                 );
             });
@@ -706,7 +798,7 @@ impl PulseGlassApp {
 
         ui.add_space(8.0);
 
-        // Compact Telemetry Footer: Storage (M.2/SATA + Temp) + Power (GPU W / Device W) + Network + FPS
+        // Compact Telemetry Footer: SSD (M.2/SATA + Temp) + Power (GPU W / Device W) + Network + FPS
         glass_card(ui, secondary, |ui| {
             ui.horizontal(|ui| {
                 let ssd_iface = if snap.storage.primary_interface.is_empty() {
@@ -716,13 +808,28 @@ impl PulseGlassApp {
                 };
                 ui.label(
                     RichText::new(format!(
-                        "{}  •  {}  •  %{:.0}",
+                        "{}: %{:.0}  •  {}  •  GPU {} / {}: {}",
                         ssd_iface,
+                        snap.storage.usage_percent,
                         snap.storage.temp_text(),
-                        snap.storage.usage_percent
+                        snap.power.gpu_text(),
+                        tr.t("Cihaz", "Sys"),
+                        snap.power.device_text()
                     ))
-                    .size(11.0)
-                    .color(Color32::from_rgb(255, 228, 214)),
+                    .size(10.5)
+                    .color(secondary),
+                );
+            });
+
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "↓ {:.2} MB/s    ↑ {:.2} MB/s",
+                        snap.network.download_mbps, snap.network.upload_mbps
+                    ))
+                    .size(10.5)
+                    .color(Color32::from_rgb(203, 213, 225)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let fps_txt = match snap.fps {
@@ -732,31 +839,29 @@ impl PulseGlassApp {
                     ui.label(RichText::new(fps_txt).strong().size(11.5).color(primary));
                 });
             });
-
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "GPU: {}  •  {}: {}",
-                        snap.power.gpu_text(),
-                        tr.t("Cihaz", "Device"),
-                        snap.power.device_text()
-                    ))
-                    .size(11.0)
-                    .color(secondary),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "↓ {:.1}  ↑ {:.1} MB/s",
-                            snap.network.download_mbps, snap.network.upload_mbps
-                        ))
-                        .size(10.5)
-                        .color(Color32::from_rgb(185, 200, 215)),
-                    );
-                });
-            });
         });
+
+        ui.add_space(8.0);
+
+        // Restored 2 bottom shortcut buttons matching original compact-widget.png (Apps & Hardware)
+        let mut shortcut_hovered = false;
+        ui.columns(2, |cols| {
+            let r1 = shortcut_pill_btn(&mut cols[0], tr.t("Uygulamalar", "Apps"), secondary);
+            shortcut_hovered |= r1.hovered();
+            if r1.clicked() {
+                self.tab = DetailTab::Processes;
+                self.mode = ViewMode::DetailedWidget;
+                self.apply_window_geometry(ctx);
+            }
+            let r2 = shortcut_pill_btn(&mut cols[1], tr.t("Donanım", "Hardware"), secondary);
+            shortcut_hovered |= r2.hovered();
+            if r2.clicked() {
+                self.tab = DetailTab::Hardware;
+                self.mode = ViewMode::DetailedWidget;
+                self.apply_window_geometry(ctx);
+            }
+        });
+        shortcut_hovered
     }
 
     fn render_detailed_dashboard(
@@ -768,35 +873,33 @@ impl PulseGlassApp {
         primary: Color32,
         secondary: Color32,
     ) {
+        // Restored clean tab bar matching detailed-overview.png
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let tabs = [
                 (DetailTab::Overview, tr.t("Genel Bakış", "Overview")),
-                (DetailTab::Hardware, tr.t("Donanım", "Hardware")),
+                (DetailTab::Hardware, tr.t("Donanım", "Hardware Details")),
                 (DetailTab::Processes, tr.t("Uygulamalar", "Processes")),
                 (DetailTab::Settings, tr.t("Ayarlar", "Settings")),
                 (DetailTab::Updates, tr.t("Güncellemeler", "Updates")),
             ];
             for (t, label) in tabs {
-                let selected = self.tab == t;
-                if header_btn(ui, label, selected, primary).clicked() {
+                if tab_pill_btn(ui, label, self.tab == t, secondary).clicked() {
                     self.tab = t;
                 }
             }
         });
-        ui.add_space(4.0);
-        ui.separator();
-        ui.add_space(4.0);
+        ui.add_space(6.0);
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            match self.tab {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.tab {
                 DetailTab::Overview => self.render_tab_overview(ui, snap, tr, primary, secondary),
                 DetailTab::Hardware => self.render_tab_hardware(ui, snap, tr, primary, secondary),
                 DetailTab::Processes => self.render_tab_processes(ui, snap, tr, primary, secondary),
                 DetailTab::Settings => self.render_tab_settings(ui, ctx, tr, primary, secondary),
                 DetailTab::Updates => self.render_tab_updates(ui, ctx, tr, primary, secondary),
-            }
-        });
+            });
     }
 
     fn render_tab_overview(
@@ -807,42 +910,167 @@ impl PulseGlassApp {
         primary: Color32,
         secondary: Color32,
     ) {
-        self.render_compact_widget(ui, snap, tr, primary, secondary);
+        // 4 Rounded Gauge Cards matching detailed-overview.png
+        ui.columns(4, |cols| {
+            glass_card(&mut cols[0], secondary, |ui| {
+                ui.vertical_centered(|ui| {
+                    draw_circular_gauge(
+                        ui,
+                        82.0,
+                        snap.cpu.usage_percent,
+                        "CPU",
+                        &snap.cpu.temp_text(),
+                        secondary,
+                        primary,
+                        self.settings.cpu_use_thresh,
+                    );
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(tr.t("İşlemci (CPU)", "Processor (CPU)")).strong().size(11.0).color(Color32::from_rgb(255, 241, 235)));
+                    ui.label(
+                        RichText::new(format!(
+                            "{:.2} GHz ({}C/{}T)",
+                            snap.cpu.current_clock_ghz, snap.cpu.physical_cores, snap.cpu.logical_processors
+                        ))
+                        .size(10.0)
+                        .color(secondary),
+                    );
+                });
+            });
+
+            glass_card(&mut cols[1], secondary, |ui| {
+                ui.vertical_centered(|ui| {
+                    draw_circular_gauge(
+                        ui,
+                        82.0,
+                        snap.gpu.usage_percent,
+                        "GPU",
+                        &snap.gpu.temp_text(),
+                        secondary,
+                        primary,
+                        85.0,
+                    );
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(tr.t("Harici GPU", "Discrete GPU")).strong().size(11.0).color(Color32::from_rgb(255, 241, 235)));
+                    ui.label(RichText::new(snap.gpu.vram_text()).size(10.0).color(secondary));
+                });
+            });
+
+            glass_card(&mut cols[2], secondary, |ui| {
+                ui.vertical_centered(|ui| {
+                    let igpu_t = if snap.igpu.is_available {
+                        snap.igpu.temp_text()
+                    } else {
+                        "N/A".to_string()
+                    };
+                    draw_circular_gauge(
+                        ui,
+                        82.0,
+                        if snap.igpu.is_available { snap.igpu.usage_percent } else { 0.0 },
+                        "iGPU",
+                        &igpu_t,
+                        secondary,
+                        primary,
+                        85.0,
+                    );
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(tr.t("Dahili GPU (iGPU)", "Integrated GPU")).strong().size(11.0).color(Color32::from_rgb(255, 241, 235)));
+                    let sub = if snap.igpu.is_available {
+                        format!("{:.1} GB", snap.igpu.total_vram_gb.max(snap.igpu.used_vram_gb))
+                    } else {
+                        tr.t("Algılanmadı", "Not Detected").to_string()
+                    };
+                    ui.label(RichText::new(sub).size(10.0).color(secondary));
+                });
+            });
+
+            glass_card(&mut cols[3], secondary, |ui| {
+                ui.vertical_centered(|ui| {
+                    let ram_sub = if snap.ram.used_gb >= 1.0 {
+                        format!("{:.0} GB", snap.ram.used_gb.round())
+                    } else {
+                        format!("{:.0} MB", snap.ram.used_gb * 1024.0)
+                    };
+                    draw_circular_gauge(
+                        ui,
+                        82.0,
+                        snap.ram.usage_percent,
+                        "RAM",
+                        &ram_sub,
+                        secondary,
+                        primary,
+                        75.0_f32.min(self.settings.ram_use_thresh),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(tr.t("Bellek (RAM)", "Memory (RAM)")).strong().size(11.0).color(Color32::from_rgb(255, 241, 235)));
+                    ui.label(
+                        RichText::new(format!("{:.1} / {:.0} GB", snap.ram.used_gb, snap.ram.installed_gb))
+                            .size(10.0)
+                            .color(secondary),
+                    );
+                });
+            });
+        });
+
         ui.add_space(8.0);
 
+        // Storage + Network + FPS Horizontal Strip
+        glass_card(ui, secondary, |ui| {
+            ui.horizontal(|ui| {
+                let ssd_iface = if snap.storage.primary_interface.is_empty() {
+                    "SSD".to_string()
+                } else {
+                    format!("SSD [{}]", snap.storage.primary_interface)
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "{}: %{:.0}  |  {}: {}  |  {}: ↓{:.1} ↑{:.1} MB/s",
+                        ssd_iface,
+                        snap.storage.usage_percent,
+                        tr.t("Sıcaklık", "Temp"),
+                        snap.storage.temp_text(),
+                        tr.t("Ağ", "Net"),
+                        snap.network.download_mbps,
+                        snap.network.upload_mbps
+                    ))
+                    .size(11.0)
+                    .color(secondary),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let fps_txt = match snap.fps {
+                        Some(f) => format!("FPS: {}", f),
+                        None => "FPS: --".to_string(),
+                    };
+                    ui.label(RichText::new(fps_txt).strong().size(12.0).color(primary));
+                });
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // Power & Wattage Card
         glass_card(ui, secondary, |ui| {
             ui.label(
                 RichText::new(tr.t("Güç Tüketimi (Watt)", "Power Consumption (Watts)"))
                     .strong()
-                    .size(12.5)
+                    .size(12.0)
                     .color(secondary),
             );
             ui.add_space(4.0);
             ui.columns(3, |cols| {
                 cols[0].vertical(|ui| {
                     ui.label(RichText::new(tr.t("Ekran Kartı (GPU)", "GPU Power")).size(10.5).color(Color32::GRAY));
-                    ui.label(
-                        RichText::new(snap.gpu.power_text())
-                            .strong()
-                            .size(14.5)
-                            .color(primary),
-                    );
+                    ui.label(RichText::new(snap.gpu.power_text()).strong().size(14.0).color(primary));
                 });
                 cols[1].vertical(|ui| {
                     ui.label(RichText::new(tr.t("İşlemci (CPU)", "CPU Package")).size(10.5).color(Color32::GRAY));
-                    ui.label(
-                        RichText::new(snap.power.cpu_text())
-                            .strong()
-                            .size(14.5)
-                            .color(secondary),
-                    );
+                    ui.label(RichText::new(snap.power.cpu_text()).strong().size(14.0).color(secondary));
                 });
                 cols[2].vertical(|ui| {
                     ui.label(RichText::new(tr.t("Genel Cihaz", "Total Device")).size(10.5).color(Color32::GRAY));
                     ui.label(
                         RichText::new(snap.power.device_text())
                             .strong()
-                            .size(14.5)
+                            .size(14.0)
                             .color(Color32::from_rgb(255, 241, 235)),
                     );
                 });
@@ -863,6 +1091,7 @@ impl PulseGlassApp {
 
         ui.add_space(8.0);
 
+        // Core Load Bars
         glass_card(ui, secondary, |ui| {
             ui.label(
                 RichText::new(format!(
@@ -872,7 +1101,7 @@ impl PulseGlassApp {
                     snap.cpu.logical_processors
                 ))
                 .strong()
-                .size(12.0)
+                .size(11.5)
                 .color(secondary),
             );
             ui.add_space(4.0);
@@ -883,7 +1112,7 @@ impl PulseGlassApp {
                         ui.label(RichText::new(format!("C{:02}", i)).size(10.0).color(Color32::GRAY));
                         let bar = egui::ProgressBar::new((u / 100.0).clamp(0.0, 1.0))
                             .desired_width(64.0)
-                            .desired_height(10.0)
+                            .desired_height(9.0)
                             .fill(if u >= self.settings.cpu_use_thresh { primary } else { secondary });
                         ui.add(bar);
                         ui.label(RichText::new(format!("{:.0}%", u)).size(10.0));
@@ -904,7 +1133,6 @@ impl PulseGlassApp {
         primary: Color32,
         secondary: Color32,
     ) {
-        // 1. CPU Card + PawnIO hint (PR #2 by misutesu-desu)
         glass_card(ui, secondary, |ui| {
             ui.label(RichText::new(tr.t("İŞLEMCİ (CPU)", "PROCESSOR (CPU)")).strong().size(11.0).color(secondary));
             ui.label(RichText::new(&snap.cpu.name).strong().size(13.0).color(Color32::from_rgb(255, 241, 235)));
@@ -939,10 +1167,7 @@ impl PulseGlassApp {
                         .size(10.5)
                         .color(secondary),
                     );
-                    if ui
-                        .link(RichText::new("pawnio.eu").size(10.5).color(primary))
-                        .clicked()
-                    {
+                    if ui.link(RichText::new("pawnio.eu").size(10.5).color(primary)).clicked() {
                         open_url_non_elevated("https://pawnio.eu");
                     }
                 });
@@ -951,7 +1176,6 @@ impl PulseGlassApp {
 
         ui.add_space(6.0);
 
-        // 2. Discrete GPU Card
         glass_card(ui, secondary, |ui| {
             ui.label(RichText::new(tr.t("HARİCİ EKRAN KARTI (dGPU)", "DISCRETE GPU")).strong().size(11.0).color(secondary));
             ui.label(RichText::new(if snap.gpu.name.is_empty() { "N/A" } else { &snap.gpu.name }).strong().size(13.0).color(Color32::from_rgb(255, 241, 235)));
@@ -978,7 +1202,6 @@ impl PulseGlassApp {
 
         ui.add_space(6.0);
 
-        // 3. Integrated GPU Card
         if snap.igpu.is_available {
             glass_card(ui, secondary, |ui| {
                 ui.label(RichText::new(tr.t("DAHİLİ GPU (iGPU)", "INTEGRATED GPU")).strong().size(11.0).color(secondary));
@@ -999,7 +1222,6 @@ impl PulseGlassApp {
             ui.add_space(6.0);
         }
 
-        // 4. Power & Overall Device Wattage Card
         glass_card(ui, secondary, |ui| {
             ui.label(RichText::new(tr.t("GÜÇ & WATT DEĞERLERİ", "POWER & WATTAGE")).strong().size(11.0).color(secondary));
             ui.label(
@@ -1023,7 +1245,6 @@ impl PulseGlassApp {
 
         ui.add_space(6.0);
 
-        // 5. RAM Card
         glass_card(ui, secondary, |ui| {
             ui.label(RichText::new(tr.t("BELLEK (RAM)", "MEMORY (RAM)")).strong().size(11.0).color(secondary));
             ui.label(
@@ -1046,7 +1267,6 @@ impl PulseGlassApp {
 
         ui.add_space(6.0);
 
-        // 6. Storage Cards (M.2 / NVMe / SATA / RAID / USB + Temp)
         glass_card(ui, secondary, |ui| {
             ui.label(
                 RichText::new(format!(
@@ -1068,7 +1288,7 @@ impl PulseGlassApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(format!("• {}", d.model)).strong().size(11.5).color(Color32::from_rgb(255, 241, 235)));
                         egui::Frame::none()
-                            .fill(Color32::from_rgba_unmultiplied(primary.r(), primary.g(), primary.b(), 45))
+                            .fill(Color32::from_rgb(70, 28, 42))
                             .stroke(Stroke::new(1.0_f32, primary))
                             .rounding(Rounding::same(5.0))
                             .inner_margin(egui::Margin::symmetric(6.0, 1.0))
@@ -1102,6 +1322,7 @@ impl PulseGlassApp {
         });
     }
 
+    /// Fixed-width 4-column Processes list with RIGHT-CLICK context menu (Open Location, Copy Path, Terminate).
     fn render_tab_processes(
         &mut self,
         ui: &mut egui::Ui,
@@ -1112,7 +1333,7 @@ impl PulseGlassApp {
     ) {
         ui.horizontal(|ui| {
             ui.label(tr.t("Ara:", "Search:"));
-            ui.add(egui::TextEdit::singleline(&mut self.proc_search).desired_width(140.0));
+            ui.add(egui::TextEdit::singleline(&mut self.proc_search).desired_width(150.0));
             ui.checkbox(&mut self.proc_group, tr.t("Grupla", "Group"));
             egui::ComboBox::from_id_salt("proc_sort")
                 .selected_text(match self.proc_sort {
@@ -1129,7 +1350,16 @@ impl PulseGlassApp {
                 });
         });
 
+        ui.label(
+            RichText::new(tr.t(
+                "İpucu: Bir uygulamaya sağ tıklayarak dosya konumunu açabilir, yolunu kopyalayabilir veya görevi sonlandırabilirsiniz.",
+                "Tip: Right-click any process to open file location, copy path, or terminate.",
+            ))
+            .size(10.0)
+            .color(Color32::from_rgb(155, 168, 185)),
+        );
         ui.add_space(4.0);
+
         let q = self.proc_search.trim().to_lowercase();
         let mut list: Vec<_> = snap
             .processes
@@ -1144,49 +1374,107 @@ impl PulseGlassApp {
             ProcSort::Name => list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         }
 
-        egui::Grid::new("proc_table")
-            .striped(true)
-            .num_columns(5)
-            .spacing([8.0, 3.0])
-            .show(ui, |ui| {
-                ui.label(RichText::new(tr.t("Uygulama", "Process")).strong().color(secondary));
-                ui.label(RichText::new("CPU").strong().color(secondary));
-                ui.label(RichText::new("RAM").strong().color(secondary));
-                ui.label(RichText::new("Disk").strong().color(secondary));
-                ui.label(RichText::new(tr.t("İşlem", "Actions")).strong().color(secondary));
-                ui.end_row();
+        let total_w = ui.available_width().max(420.0);
+        let col_name = (total_w - 255.0).max(160.0);
+        let col_cpu = 70.0;
+        let col_ram = 85.0;
+        let col_disk = 80.0;
 
-                for p in list.into_iter().take(80) {
-                    let name = if p.instance_count > 1 {
-                        format!("{} ({})", p.name, p.instance_count)
-                    } else {
-                        p.name.clone()
-                    };
-                    ui.label(RichText::new(name).size(11.0));
-                    ui.label(RichText::new(format!("{:.1}%", p.cpu_percent)).size(11.0));
-                    ui.label(RichText::new(p.ram_text()).size(11.0));
-                    ui.label(RichText::new(format!("{:.1} MB/s", p.disk_mbps)).size(11.0));
+        // Table Header
+        egui::Frame::none()
+            .fill(Color32::from_rgb(46, 26, 38))
+            .rounding(Rounding::same(6.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_sized([col_name, 16.0], egui::Label::new(RichText::new(tr.t("Uygulama", "Process")).strong().size(11.0).color(secondary)).truncate());
+                    ui.add_sized([col_cpu, 16.0], egui::Label::new(RichText::new("CPU").strong().size(11.0).color(secondary)));
+                    ui.add_sized([col_ram, 16.0], egui::Label::new(RichText::new("RAM").strong().size(11.0).color(secondary)));
+                    ui.add_sized([col_disk, 16.0], egui::Label::new(RichText::new("Disk").strong().size(11.0).color(secondary)));
+                });
+            });
+
+        ui.add_space(2.0);
+
+        for (idx, p) in list.into_iter().take(90).enumerate() {
+            let name = if p.instance_count > 1 {
+                format!("{} ({})", p.name, p.instance_count)
+            } else {
+                p.name.clone()
+            };
+            let row_bg = if idx % 2 == 0 {
+                Color32::from_rgb(30, 24, 34)
+            } else {
+                Color32::from_rgb(24, 19, 28)
+            };
+
+            let row_resp = egui::Frame::none()
+                .fill(row_bg)
+                .rounding(Rounding::same(4.0))
+                .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        if !p.exe_path.is_empty()
-                            && ui.small_button(tr.t("Konum", "Dir")).clicked()
-                        {
-                            open_file_location(&p.exe_path);
-                        }
-                        if !p.exe_path.is_empty()
-                            && ui.small_button(tr.t("Kopyala", "Copy")).clicked()
-                        {
-                            ui.output_mut(|o| o.copied_text = p.exe_path.clone());
-                        }
-                        if ui
-                            .small_button(RichText::new(tr.t("Bitir", "Kill")).color(primary))
-                            .clicked()
-                        {
-                            let _ = kill_process_by_pid(p.pid);
-                        }
+                        ui.add_sized(
+                            [col_name, 16.0],
+                            egui::Label::new(RichText::new(&name).size(11.0).color(Color32::from_rgb(240, 232, 230)))
+                                .truncate(),
+                        );
+                        ui.add_sized(
+                            [col_cpu, 16.0],
+                            egui::Label::new(RichText::new(format!("{:.1}%", p.cpu_percent)).size(11.0)),
+                        );
+                        ui.add_sized(
+                            [col_ram, 16.0],
+                            egui::Label::new(RichText::new(p.ram_text()).size(11.0)),
+                        );
+                        ui.add_sized(
+                            [col_disk, 16.0],
+                            egui::Label::new(RichText::new(format!("{:.1} MB/s", p.disk_mbps)).size(11.0)),
+                        );
                     });
-                    ui.end_row();
+                })
+                .response;
+
+            // Make entire row right-clickable for context menu
+            let click_resp = ui.interact(
+                row_resp.rect,
+                egui::Id::new(("proc_row", p.pid, idx)),
+                egui::Sense::click(),
+            );
+            let pid = p.pid;
+            let exe_path = p.exe_path.clone();
+            let tr_open = tr.t("Dosya Konumunu Aç", "Open File Location").to_string();
+            let tr_copy = tr.t("Dosya Yolunu Kopyala", "Copy File Path").to_string();
+            let tr_kill = tr.t("Görevi Sonlandır", "Terminate Process").to_string();
+
+            click_resp.context_menu(|ui| {
+                ui.set_min_width(170.0);
+                ui.label(RichText::new(&name).strong().color(secondary));
+                ui.separator();
+                if ui
+                    .add_enabled(!exe_path.is_empty(), egui::Button::new(tr_open))
+                    .clicked()
+                {
+                    open_file_location(&exe_path);
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(!exe_path.is_empty(), egui::Button::new(tr_copy))
+                    .clicked()
+                {
+                    ui.output_mut(|o| o.copied_text = exe_path.clone());
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui
+                    .button(RichText::new(tr_kill).strong().color(primary))
+                    .clicked()
+                {
+                    let _ = kill_process_by_pid(pid);
+                    ui.close_menu();
                 }
             });
+        }
     }
 
     fn render_tab_settings(
@@ -1298,7 +1586,7 @@ impl PulseGlassApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label(tr.t("Temalar:", "Themes:"));
                 let presets = [
-                    ("Nar Çiçeği", "#FF4D6D", "#FFB085", "#120F18"),
+                    ("Nar Çiçeği", "#FF4D6D", "#FFB085", "#140E16"),
                     ("Cyber Cyan", "#00E5FF", "#7C4DFF", "#0B101B"),
                     ("Emerald", "#10B981", "#6EE7B7", "#0B1714"),
                     ("Amber Gold", "#F59E0B", "#FDE68A", "#1A140B"),
@@ -1505,7 +1793,6 @@ impl PulseGlassApp {
     }
 }
 
-/// Loads native Windows (Segoe UI) or Linux (DejaVuSans / NotoSans) font for crisp Turkish glyphs.
 pub fn load_system_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let candidates: &[&str] = if cfg!(windows) {
@@ -1538,12 +1825,13 @@ pub fn load_system_fonts(ctx: &egui::Context) {
 fn configure_visuals(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
-    style.visuals.window_fill = Color32::TRANSPARENT;
+    style.visuals.window_fill = Color32::from_rgb(24, 18, 28);
     style.visuals.panel_fill = Color32::TRANSPARENT;
+    style.visuals.popup_shadow = egui::epaint::Shadow::NONE;
     style.visuals.override_text_color = Some(Color32::from_rgb(245, 232, 230));
-    style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 20);
-    style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 77, 109, 65);
-    style.visuals.widgets.active.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 77, 109, 105);
+    style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(40, 32, 44);
+    style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(76, 32, 48);
+    style.visuals.widgets.active.weak_bg_fill = Color32::from_rgb(108, 38, 60);
     style.visuals.widgets.inactive.rounding = Rounding::same(6.0);
     style.visuals.widgets.hovered.rounding = Rounding::same(6.0);
     style.visuals.widgets.active.rounding = Rounding::same(6.0);
