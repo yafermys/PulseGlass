@@ -1,13 +1,13 @@
-# PulseGlass Hardware Monitor (`v1.3.0`)
+# PulseGlass Hardware Monitor (`v2.0.0` — Rust Edition)
 
-A lightweight, glassmorphic Windows desktop hardware monitor, overlay strip, and system utility built with C# and WPF (.NET Framework).
+A blazing-fast, ultra-lightweight, glassmorphic desktop hardware monitor, pure OSD summary strip, and system utility rewritten from scratch in **Rust** (`egui`/`eframe`) for **Windows** and **Linux**.
 
 ---
 
 ## 📸 Screenshots
 
-### Compact Widget & Summary Strip (`Mini Mode`)
-| Compact Widget | Summary Strip (with Live FPS) |
+### Compact Widget & Summary Strip (`Ctrl + Enter`)
+| Compact Widget | Summary Strip (Pure OSD) |
 | :---: | :---: |
 | ![Compact Widget](Assets/screenshots/compact-widget.png) | ![Summary Strip](Assets/screenshots/summary-strip.png) |
 
@@ -21,44 +21,57 @@ A lightweight, glassmorphic Windows desktop hardware monitor, overlay strip, and
 
 ---
 
-## ✨ Key Features
+## ✨ What's New in `v2.0.0`
 
-- **Three Seamless Display Modes**
-  - **Compact Widget:** Circular gauges for CPU, Discrete GPU, Integrated GPU (iGPU), and RAM, plus SSD/Network telemetry and quick shortcuts.
-  - **Summary Strip (`Mini Mode`):** Ultra-compact single-line overlay with **live FPS** (built-in Windows DXGI ETW + RTSS fallback) and **customizable metrics** (`CPU %`, `CPU °C`, `GPU %`, `GPU °C`, `iGPU %`, `RAM %`, `SSD °C`, `FPS`) configurable in Settings.
-  - **Detailed Window:** Full tabbed dashboard for Overview, Hardware Details, Processes, Settings, and Updates.
-- **Ghost Mode (Click-Through):** Toggle click-through transparency at any time with `Shift + Enter` so the widget stays visible without blocking clicks.
-- **Middle-Click Drag & Desktop Pin:** Drag the widget from anywhere using the middle mouse button, or pin it to the desktop / keep it always on top.
-- **Process Manager:** Search, sort, and group running apps, and right-click any process to open its file location, copy its path, or terminate it immediately.
-- **Built-in Update Center:**
-  - Automatically checks for updates at startup and every **6 hours**, with a manual **Check Now** button in the **Updates** tab.
-  - Separates **Important / Recommended Windows Updates** from **Optional Windows Updates** using the native Windows Update Agent (`Microsoft.Update.Session`).
-  - Checks for new **PulseGlass** releases and downloads/installs updates **only after explicit user confirmation**.
-- **Bilingual UI & Custom Themes:** Switch between **English** and **Türkçe** in Settings, and customize widget/window opacity, UI scale, alert thresholds, and color palettes (5 presets + custom Hex editor).
+- **Rewritten in Rust for Maximum Efficiency:** Native compiled single binary with thin LTO, background telemetry worker thread, zero runtime `.dll` dependencies, and minimal CPU/RAM overhead.
+- **Cross-Platform (Windows 10/11 & Linux):**
+  - **Windows:** Direct Win32 NVML FFI (`nvml.dll`, zero `nvidia-smi` process spam), native Windows Energy Meter Interface (**EMI** RAPL for CPU wattage **without WinRing0**), `StorageDeviceProtocolSpecificProperty` NVMe SMART temperature (works even through Intel VMD `iaStorVD` RAID 0 volumes!), built-in DXGI ETW + RTSS live FPS, and `CallNtPowerInformation` battery wattage.
+  - **Linux (Ubuntu, Debian, Fedora, Arch, etc. — X11 & Wayland):** Native `/sys/class/hwmon`, `/sys/class/powercap/intel-rapl` CPU wattage, `/sys/class/drm` AMD/Intel GPU telemetry + NVIDIA GPU wattage, `/sys/block` M.2 NVMe / SATA / USB detection, and `/sys/class/power_supply` battery wattage.
+- **No WinRing0 (Windows Defender Friendly):** Incorporates [PR #1](https://github.com/yafermys/PulseGlass/pull/1) and [PR #2](https://github.com/yafermys/PulseGlass/pull/2) by **[@misutesu-desu](https://github.com/misutesu-desu)**:
+  - Zero `WinRing0` driver usage (no `VulnerableDriver:WinNT/Winring0` alerts).
+  - Detects optional [PawnIO](https://pawnio.eu) driver on Windows and opens the download link via `explorer.exe` without inheriting elevated privileges.
+  - Hardened self-updater: strictly selects the platform executable asset (never falls back to release API JSON) and verifies `MZ` (Windows PE) / `\x7fELF` (Linux ELF) binary headers before replacing.
+  - Cleans up stale `LibreHardwareMonitorLib.dll` files left next to the executable from `v1.3.0`.
+- **Detailed Storage Identification:** Clearly distinguishes **NVMe M.2**, **NVMe M.2 (Intel VMD RAID)**, **SATA SSD**, **SATA HDD**, and **USB** drives along with live per-drive temperature.
+- **Live GPU & Total Device Wattage:** Displays live **GPU Power Draw (W / TDP)**, **CPU Package Power (W)**, and **Total Device Power Draw (W)** across Compact Widget, Overview, Hardware Details, and Summary OSD.
+- **Independent Opacities & Pure Summary OSD (`Ctrl + Enter`):**
+  - **Summary OSD (`Ctrl + Enter`):** Always 100% transparent, zero title bar/borders/buttons — shows **only** your chosen metrics with crisp drop shadows.
+  - **Widget Opacity** and **Window Opacity** are completely independent and never affect each other or the Summary OSD.
+  - **Ghost Click-Through Mode (`Shift + Enter`)**: Click right through the overlay while gaming or working.
+- **Installed App Mode AND Portable Mode:**
+  - **System Installer (`PulseGlass-Setup.exe` or `PulseGlass.exe --install` or Settings -> Install):** Installs PulseGlass into **Windows Installed Apps (Settings -> Apps)** + Start Menu + optional Desktop shortcut, with full uninstaller support (`--uninstall`). On Linux, installs to `~/.local/bin/pulseglass` and registers a `.desktop` launcher.
+  - **Portable Mode (`PulseGlass.exe` / `--portable`):** Run directly from any folder with zero installation!
 
 ---
 
 ## 🚀 Getting Started
 
-### Option 1: Download Prebuilt Binary
-1. Go to the [**Releases**](https://github.com/yafermys/PulseGlass/releases) page.
-2. Download `PulseGlassWidget.exe`. Libraries are embedded in the exe. Releases up to v1.3.0 also need `LibreHardwareMonitorLib.dll` in the same folder.
-3. Run `PulseGlassWidget.exe` (Windows 10 / 11 x64, .NET Framework 4.7.2 or later).
-   - *Administrator Privileges:* PulseGlass requests Administrator elevation on launch so the built-in **DXGI ETW FPS counter** and **LibreHardwareMonitorLib** storage/CPU temperature sensors work out of the box without external tools like RTSS.
-   - *CPU temperature:* LibreHardwareMonitorLib reads CPU sensors through the [PawnIO](https://pawnio.eu) driver. If CPU temperature is missing, install PawnIO once and restart PulseGlass.
+### Windows
+- **Option A — System Installer (Appears in Windows Installed Apps & Start Menu):**
+  Download and run `PulseGlass-Setup.exe` from [**Releases**](https://github.com/yafermys/PulseGlass/releases) (also lets you extract Portable mode).
+- **Option B — Portable (Single Executable):**
+  Download `PulseGlass.exe` from [**Releases**](https://github.com/yafermys/PulseGlass/releases) and run it directly. You can also install it into Windows Apps anytime from **Settings -> Install to OS Apps**.
 
-### Option 2: Build from Source
-```powershell
-MSBuild.exe PulseGlassWidget.csproj /p:Configuration=Release /p:Platform=x64 /p:OutDir=Release_Publish\
+### Linux
+1. Download `pulseglass-linux-x86_64` from [**Releases**](https://github.com/yafermys/PulseGlass/releases) (or build from source below).
+2. Make it executable and run portable:
+   ```bash
+   chmod +x pulseglass-linux-x86_64
+   ./pulseglass-linux-x86_64
+   ```
+3. Or install to your desktop menu (`~/.local/bin/pulseglass` + `.desktop`):
+   ```bash
+   ./pulseglass-linux-x86_64 --install
+   ```
+
+### Build from Source (Windows & Linux)
+```bash
+# Portable executable
+cargo build --release --bin PulseGlass
+
+# Windows standalone setup wizard (embeds target/release/PulseGlass.exe)
+cargo build --release --bin PulseGlass-Setup --features embed-app
 ```
-
----
-
-## 🛠 Tech Stack
-
-- **Language & UI:** C# / WPF (.NET Framework 4.7.2)
-- **System Telemetry:** `LibreHardwareMonitorLib` (`0.9.6`, PawnIO), Windows DXGI ETW (`Microsoft-Windows-DXGI`), Windows API (`GlobalMemoryStatusEx`, `GetSystemTimes`, `GetPhysicallyInstalledSystemMemory`), WMI, Performance Counters, and `RTSSSharedMemoryV2` fallback
-- **Updates:** Windows Update Agent COM (`Microsoft.Update.Session`) & GitHub Releases API
 
 ---
 
