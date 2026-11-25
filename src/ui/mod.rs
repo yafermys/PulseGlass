@@ -82,6 +82,50 @@ pub struct PulseGlassApp {
 
     // Native Win32 manual window drag state: (hwnd, start_cursor_x, start_cursor_y, start_win_x, start_win_y)
     win_drag: Option<(isize, i32, i32, i32, i32)>,
+
+    // Embedded app logo texture (shown in header in Widget & Application modes) + Win32 icon state
+    app_icon_tex: Option<egui::TextureHandle>,
+    win_icon_applied: bool,
+}
+
+fn load_app_icon_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let bytes = include_bytes!("../../Assets/app.png");
+    let img = image::load_from_memory(bytes)
+        .ok()?
+        .resize(64, 64, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img.into_raw());
+    Some(ctx.load_texture("pulseglass_app_icon", color_image, egui::TextureOptions::LINEAR))
+}
+
+#[cfg(windows)]
+fn apply_win32_window_icon(window_title: &str) -> bool {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, LoadImageW, SendMessageW, SetClassLongPtrW, GCLP_HICON, GCLP_HICONSM,
+        ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, WM_SETICON,
+    };
+    let title_w: Vec<u16> = window_title.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title_w.as_ptr());
+        if hwnd.is_null() {
+            return false;
+        }
+        let hinst = GetModuleHandleW(std::ptr::null());
+        let icon_id = 1usize as *const u16; // MAKEINTRESOURCEW(1) -> embedded RT_GROUP_ICON #1
+        let h_big = LoadImageW(hinst, icon_id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+        let h_small = LoadImageW(hinst, icon_id, IMAGE_ICON, 16, 16, LR_SHARED);
+        if !h_big.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, h_big as isize);
+            SetClassLongPtrW(hwnd, GCLP_HICON, h_big as isize);
+        }
+        if !h_small.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, h_small as isize);
+            SetClassLongPtrW(hwnd, GCLP_HICONSM, h_small as isize);
+        }
+        !h_big.is_null() || !h_small.is_null()
+    }
 }
 
 impl PulseGlassApp {
@@ -89,6 +133,7 @@ impl PulseGlassApp {
         let settings = load_settings();
         load_system_fonts(&cc.egui_ctx);
         configure_visuals(&cc.egui_ctx);
+        let app_icon_tex = load_app_icon_texture(&cc.egui_ctx);
 
         let telemetry = TelemetryHandle::spawn(&settings, cc.egui_ctx.clone());
         let hotkeys = start_global_hotkeys(cc.egui_ctx.clone());
@@ -125,6 +170,8 @@ impl PulseGlassApp {
             screenshot_requested: false,
             frame_count: 0,
             win_drag: None,
+            app_icon_tex,
+            win_icon_applied: false,
         }
     }
 
@@ -305,6 +352,10 @@ impl PulseGlassApp {
                     ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
                 }
             }
+        }
+        #[cfg(windows)]
+        {
+            let _ = apply_win32_window_icon("PulseGlass Hardware Monitor");
         }
     }
 
@@ -488,6 +539,14 @@ impl eframe::App for PulseGlassApp {
             }
         }
 
+        // Apply Win32 executable resource icon to HWND (Taskbar, Alt+Tab, Window frame)
+        #[cfg(windows)]
+        if !self.win_icon_applied && self.frame_count <= 20 {
+            if apply_win32_window_icon("PulseGlass Hardware Monitor") {
+                self.win_icon_applied = true;
+            }
+        }
+
         // 1. Default top-right positioning on first launch (validating saved coords so minimized coords never trap off-screen)
         if !self.positioned_initial {
             self.positioned_initial = true;
@@ -628,17 +687,42 @@ impl eframe::App for PulseGlassApp {
                 let mut wants_drag = false;
                 let mut btn_hovered = false;
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 5.0;
-                    let dot_color = if !snap.alerts.is_empty() {
-                        Color32::from_rgb(239, 68, 68)
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let icon_px = if self.mode == ViewMode::FullWindow {
+                        20.0
                     } else {
-                        primary
+                        17.0
                     };
-                    let (dot_rect, dot_resp) =
-                        ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::click_and_drag());
-                    ui.painter().circle_filled(dot_rect.center(), 4.2, dot_color);
-                    if dot_resp.hovered() && primary_pressed {
-                        wants_drag = true;
+                    if let Some(ref tex) = self.app_icon_tex {
+                        let icon_resp = ui.add(
+                            egui::Image::new((tex.id(), Vec2::splat(icon_px)))
+                                .rounding(Rounding::same(4.0))
+                                .sense(egui::Sense::click_and_drag()),
+                        );
+                        if !snap.alerts.is_empty() {
+                            ui.painter().circle_filled(
+                                icon_resp.rect.right_top() + Vec2::new(-2.0, 2.0),
+                                3.2,
+                                Color32::from_rgb(239, 68, 68),
+                            );
+                        }
+                        if icon_resp.hovered() && primary_pressed {
+                            wants_drag = true;
+                        }
+                    } else {
+                        let dot_color = if !snap.alerts.is_empty() {
+                            Color32::from_rgb(239, 68, 68)
+                        } else {
+                            primary
+                        };
+                        let (dot_rect, dot_resp) = ui.allocate_exact_size(
+                            Vec2::splat(10.0),
+                            egui::Sense::click_and_drag(),
+                        );
+                        ui.painter().circle_filled(dot_rect.center(), 4.2, dot_color);
+                        if dot_resp.hovered() && primary_pressed {
+                            wants_drag = true;
+                        }
                     }
 
                     let title_resp = ui.add(
