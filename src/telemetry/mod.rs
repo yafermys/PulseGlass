@@ -90,7 +90,7 @@ fn run_worker(
     #[cfg(windows)]
     let etw_fps = windows::EtwFpsMonitor::start();
     #[cfg(windows)]
-    let mut cached_cpu_temp: Option<f32> = None;
+    let pdh_thermal = windows::PdhThermalReader::try_new();
 
     #[cfg(target_os = "linux")]
     let mut rapl = linux::LinuxRaplReader::new();
@@ -136,10 +136,7 @@ fn run_worker(
 
         #[cfg(windows)]
         {
-            if tick == 1 || tick % 4 == 0 {
-                cached_cpu_temp = windows::read_acpi_cpu_temp();
-            }
-            snap.cpu.temperature_c = cached_cpu_temp;
+            snap.cpu.temperature_c = pdh_thermal.as_ref().and_then(|r| r.read_temp_c());
         }
         #[cfg(target_os = "linux")]
         {
