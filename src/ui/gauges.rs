@@ -88,7 +88,10 @@ pub fn glass_card<R>(
         ))
         .rounding(Rounding::same(11.0))
         .inner_margin(egui::Margin::symmetric(11.0, 9.0))
-        .show(ui, add_contents)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add_contents(ui)
+        })
 }
 
 pub fn draw_shadowed_osd_text(ui: &mut Ui, text: &str, color: Color32, font_size: f32) -> (Rect, egui::Response) {
