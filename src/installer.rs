@@ -297,6 +297,12 @@ fn install_windows(source_exe: &Path, create_desktop: bool, en: bool) -> Result<
         }
     }
 
+    // Notify Windows Shell so Explorer / Start Menu / Desktop refresh the embedded app icon immediately
+    unsafe {
+        use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+        SHChangeNotify(SHCNE_ASSOCCHANGED as i32, SHCNF_IDLIST, std::ptr::null(), std::ptr::null());
+    }
+
     Ok(if en {
         format!(
             "Installed to {} and registered in Windows Installed Apps & Start Menu.",
