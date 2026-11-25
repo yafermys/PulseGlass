@@ -66,6 +66,7 @@ namespace PulseGlassWidget.Services
         public double GpuTempAlertThreshold { get; set; }
         public double CpuUsageAlertThreshold { get; set; }
         public double RamUsageAlertThreshold { get; set; }
+        public bool PawnIoInstalled { get; private set; }
 
         public HardwareMonitorService()
         {
@@ -75,8 +76,22 @@ namespace PulseGlassWidget.Services
             RamUsageAlertThreshold = 90.0;
         }
 
+        // LibreHardwareMonitorLib reads CPU sensors through the PawnIO driver and detects it by this key.
+        private static bool IsPawnIoInstalled()
+        {
+            try
+            {
+                using (var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO"))
+                {
+                    return key != null;
+                }
+            }
+            catch { return false; }
+        }
+
         public void InitializeStaticInfo()
         {
+            PawnIoInstalled = IsPawnIoInstalled();
             try
             {
                 _lhmComputer = new LibreHardwareMonitor.Hardware.Computer

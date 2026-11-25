@@ -8,7 +8,7 @@
     <OutputType>WinExe</OutputType>
     <RootNamespace>PulseGlassWidget</RootNamespace>
     <AssemblyName>PulseGlassWidget</AssemblyName>
-    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
+    <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
     <ProjectTypeGuids>{60dc8134-eba5-43b8-bcc9-bb4bc16c2548};{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}</ProjectTypeGuids>
     <Deterministic>true</Deterministic>
@@ -47,8 +47,14 @@
     <Reference Include="PresentationFramework" />
     <Reference Include="LibreHardwareMonitorLib">
       <HintPath>Libs\LibreHardwareMonitorLib.dll</HintPath>
-      <Private>True</Private>
+      <Private>False</Private>
     </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Loaded by App.ResolveEmbeddedAssembly so the release is a single exe. -->
+    <EmbeddedResource Include="Libs\*.dll">
+      <LogicalName>Libs.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
   <ItemGroup>
     <ApplicationDefinition Include="App.xaml">

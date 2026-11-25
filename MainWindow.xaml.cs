@@ -438,6 +438,15 @@ namespace PulseGlassWidget
                 }
                 else HwCpuNote.Visibility = Visibility.Collapsed;
 
+                if (!_monitor.PawnIoInstalled)
+                {
+                    HwPawnIoText.Text = _isEnglish
+                        ? "ℹ CPU temperature needs the PawnIO driver. Install it from"
+                        : "ℹ CPU sıcaklığı için PawnIO sürücüsü gerekli. Kurulum:";
+                    HwPawnIoNote.Visibility = Visibility.Visible;
+                }
+                else HwPawnIoNote.Visibility = Visibility.Collapsed;
+
                 HwGpuName.Text = snap.Gpu.Name;
                 HwGpuSpecs.Text = string.Format(
                     "VRAM: {0}   |   Kullanım: %{1:0.0}   |   Sıcaklık: {2}\nSaat Hızı: {3}   |   Fan: {4}   |   Sürücü: {5}",
@@ -1159,6 +1168,13 @@ namespace PulseGlassWidget
                 TxtAppUpdateStatus.Text = res;
                 BtnInstallAppUpdate.IsEnabled = true;
             }
+        }
+
+        private void PawnIoLink_RequestNavigate(object sender, System.Windows.Navigation.RequestNavigateEventArgs e)
+        {
+            // PulseGlass runs elevated. Going through explorer opens the browser as the normal user.
+            try { Process.Start("explorer.exe", "\"" + e.Uri.AbsoluteUri + "\""); } catch { }
+            e.Handled = true;
         }
 
         private void CmbLanguage_SelectionChanged(object sender, SelectionChangedEventArgs e)

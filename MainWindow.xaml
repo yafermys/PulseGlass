@@ -343,6 +343,10 @@
                                     <TextBlock x:Name="HwCpuName" Foreground="#FFF1EB" FontSize="13" FontWeight="SemiBold"/>
                                     <TextBlock x:Name="HwCpuSpecs" Foreground="#CBD5E1" FontSize="11.5" Margin="0,4,0,0" TextWrapping="Wrap"/>
                                     <TextBlock x:Name="HwCpuNote" Foreground="#FFB085" FontSize="10.5" Margin="0,3,0,0" Visibility="Collapsed"/>
+                                    <TextBlock x:Name="HwPawnIoNote" Foreground="#FFB085" FontSize="10.5" Margin="0,3,0,0" TextWrapping="Wrap" Visibility="Collapsed">
+                                        <Run x:Name="HwPawnIoText"/>
+                                        <Hyperlink NavigateUri="https://pawnio.eu" RequestNavigate="PawnIoLink_RequestNavigate" Foreground="#FFB085">pawnio.eu</Hyperlink>
+                                    </TextBlock>
                                 </StackPanel>
                             </Border>
 

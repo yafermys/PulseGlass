@@ -42,13 +42,14 @@ A lightweight, glassmorphic Windows desktop hardware monitor, overlay strip, and
 
 ### Option 1: Download Prebuilt Binary
 1. Go to the [**Releases**](https://github.com/yafermys/PulseGlass/releases) page.
-2. Download `PulseGlass-v1.3.0.zip` and extract both `PulseGlassWidget.exe` and `LibreHardwareMonitorLib.dll` into the same folder.
-3. Run `PulseGlassWidget.exe` (Windows 10 / 11, .NET Framework 4.7.2 or later).
+2. Download `PulseGlassWidget.exe`. Libraries are embedded in the exe. Releases up to v1.3.0 also need `LibreHardwareMonitorLib.dll` in the same folder.
+3. Run `PulseGlassWidget.exe` (Windows 10 / 11 x64, .NET Framework 4.7.2 or later).
    - *Administrator Privileges:* PulseGlass requests Administrator elevation on launch so the built-in **DXGI ETW FPS counter** and **LibreHardwareMonitorLib** storage/CPU temperature sensors work out of the box without external tools like RTSS.
+   - *CPU temperature:* LibreHardwareMonitorLib reads CPU sensors through the [PawnIO](https://pawnio.eu) driver. If CPU temperature is missing, install PawnIO once and restart PulseGlass.
 
 ### Option 2: Build from Source
 ```powershell
-MSBuild.exe PulseGlassWidget.csproj /p:Configuration=Release /p:Platform=AnyCPU /p:OutDir=Release_Publish\
+MSBuild.exe PulseGlassWidget.csproj /p:Configuration=Release /p:Platform=x64 /p:OutDir=Release_Publish\
 ```
 
 ---
@@ -56,7 +57,7 @@ MSBuild.exe PulseGlassWidget.csproj /p:Configuration=Release /p:Platform=AnyCPU 
 ## 🛠 Tech Stack
 
 - **Language & UI:** C# / WPF (.NET Framework 4.7.2)
-- **System Telemetry:** `LibreHardwareMonitorLib` (`0.9.3`), Windows DXGI ETW (`Microsoft-Windows-DXGI`), Windows API (`GlobalMemoryStatusEx`, `GetSystemTimes`, `GetPhysicallyInstalledSystemMemory`), WMI, Performance Counters, and `RTSSSharedMemoryV2` fallback
+- **System Telemetry:** `LibreHardwareMonitorLib` (`0.9.6`, PawnIO), Windows DXGI ETW (`Microsoft-Windows-DXGI`), Windows API (`GlobalMemoryStatusEx`, `GetSystemTimes`, `GetPhysicallyInstalledSystemMemory`), WMI, Performance Counters, and `RTSSSharedMemoryV2` fallback
 - **Updates:** Windows Update Agent COM (`Microsoft.Update.Session`) & GitHub Releases API
 
 ---
