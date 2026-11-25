@@ -1097,7 +1097,7 @@ impl PulseGlassApp {
 
         ui.add_space(8.0);
 
-        // Storage + Network + FPS Horizontal Strip
+        // Storage + Network + FPS Strip (2 clean rows so FPS is never clipped by long SSD names)
         glass_card(ui, secondary, |ui| {
             ui.horizontal(|ui| {
                 let ssd_iface = if snap.storage.primary_interface.is_empty() {
@@ -1107,24 +1107,34 @@ impl PulseGlassApp {
                 };
                 ui.label(
                     RichText::new(format!(
-                        "{}: %{:.0}  |  {}: {}  |  {}: ↓{:.1} ↑{:.1} MB/s",
+                        "{}: %{:.0}  •  {}: {}",
                         ssd_iface,
                         snap.storage.usage_percent,
                         tr.t("Sıcaklık", "Temp"),
                         snap.storage.temp_text(),
+                    ))
+                    .size(11.0)
+                    .color(secondary),
+                );
+            });
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{}: ↓{:.2}  ↑{:.2} MB/s",
                         tr.t("Ağ", "Net"),
                         snap.network.download_mbps,
                         snap.network.upload_mbps
                     ))
                     .size(11.0)
-                    .color(secondary),
+                    .color(Color32::from_rgb(203, 213, 225)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let fps_txt = match snap.fps {
                         Some(f) => format!("FPS: {}", f),
                         None => "FPS: --".to_string(),
                     };
-                    ui.label(RichText::new(fps_txt).strong().size(12.0).color(primary));
+                    ui.label(RichText::new(fps_txt).strong().size(12.5).color(primary));
                 });
             });
         });
