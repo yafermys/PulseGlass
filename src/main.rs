@@ -12,7 +12,10 @@ use std::sync::Arc;
 
 fn load_app_icon() -> Option<Arc<egui::IconData>> {
     let bytes = include_bytes!("../Assets/app.png");
-    let img = image::load_from_memory(bytes).ok()?.resize(64, 64, image::imageops::FilterType::Triangle).into_rgba8();
+    let img = image::load_from_memory(bytes)
+        .ok()?
+        .resize(64, 64, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
     let (width, height) = img.dimensions();
     Some(Arc::new(egui::IconData {
         rgba: img.into_raw(),
