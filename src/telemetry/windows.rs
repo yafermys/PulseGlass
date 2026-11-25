@@ -928,12 +928,14 @@ impl PdhThermalReader {
             return None;
         }
 
-        // Try standard ACPI thermal zone counter path
+        // Try standard ACPI thermal zone counter paths (concrete instances for PdhGetFormattedCounterValue)
         let paths = [
             r"\Thermal Zone Information(\_TZ.TZ01)\Temperature",
             r"\Thermal Zone Information(\_TZ.TZ00)\Temperature",
+            r"\Thermal Zone Information(\_TZ.TZ01_0)\Temperature",
+            r"\Thermal Zone Information(\_TZ.THM0)\Temperature",
             r"\Thermal Zone Information(\_TZ.THRM)\Temperature",
-            r"\Thermal Zone Information(*)\Temperature",
+            r"\Thermal Zone Information(\_TZ.TZ0)\Temperature",
         ];
         let mut counter: *mut c_void = std::ptr::null_mut();
         let mut added = false;
