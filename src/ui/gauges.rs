@@ -21,7 +21,7 @@ pub fn draw_circular_gauge(
     painter.circle_stroke(
         center,
         radius,
-        Stroke::new(stroke_w, Color32::from_rgba_unmultiplied(255, 255, 255, 28)),
+        Stroke::new(stroke_w, Color32::from_rgba_unmultiplied(255, 255, 255, 22)),
     );
 
     // Active arc
@@ -74,14 +74,14 @@ pub fn glass_card<R>(
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> egui::InnerResponse<R> {
     egui::Frame::none()
-        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 16))
+        .fill(Color32::from_rgba_unmultiplied(30, 24, 40, 155))
         .stroke(Stroke::new(
             1.0_f32,
             Color32::from_rgba_unmultiplied(
                 border_accent.r(),
                 border_accent.g(),
                 border_accent.b(),
-                52,
+                70,
             ),
         ))
         .rounding(Rounding::same(11.0))
