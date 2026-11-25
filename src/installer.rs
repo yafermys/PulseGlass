@@ -215,6 +215,8 @@ fn is_process_elevated() -> bool {
 
 #[cfg(windows)]
 fn create_windows_shortcut(lnk_path: &Path, target: &Path, workdir: &Path) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let ps = format!(
         "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('{}'); $s.TargetPath = '{}'; $s.WorkingDirectory = '{}'; $s.IconLocation = '{},0'; $s.Description = 'PulseGlass Hardware Monitor'; $s.Save()",
         lnk_path.display().to_string().replace('\'', "''"),
@@ -224,6 +226,7 @@ fn create_windows_shortcut(lnk_path: &Path, target: &Path, workdir: &Path) {
     );
     let _ = Command::new("powershell")
         .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
+        .creation_flags(CREATE_NO_WINDOW)
         .status();
 }
 
@@ -347,6 +350,8 @@ fn uninstall_windows(en: bool) -> Result<String, String> {
 
     // Schedule folder cleanup after process exits (safe even when uninstalling itself)
     if let Some(dir) = install_dir {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let cmd_path = std::env::temp_dir().join("pulseglass_uninstall.cmd");
         let script = format!(
             "@echo off\r\ntimeout /t 2 /nobreak >nul\r\nrmdir /s /q \"{}\"\r\ndel \"%~f0\"\r\n",
@@ -355,6 +360,7 @@ fn uninstall_windows(en: bool) -> Result<String, String> {
         if fs::write(&cmd_path, script).is_ok() {
             let _ = Command::new("cmd.exe")
                 .args(["/C", &cmd_path.display().to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
                 .spawn();
         }
     }
