@@ -30,6 +30,8 @@ pub struct AppSettings {
     pub sum_fps: bool,
     pub language: String,
     pub topmost: bool,
+    pub hotkey_summary: String,
+    pub hotkey_ghost: String,
 }
 
 impl Default for AppSettings {
@@ -60,6 +62,8 @@ impl Default for AppSettings {
             sum_fps: true,
             language: "tr".to_string(),
             topmost: true,
+            hotkey_summary: "Ctrl+Enter".to_string(),
+            hotkey_ghost: "Shift+Enter".to_string(),
         }
     }
 }
