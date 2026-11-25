@@ -96,15 +96,20 @@ fn main() -> eframe::Result<()> {
     // PR #2 (misutesu-desu): Remove stale LibreHardwareMonitorLib.dll from v1.3.0 if present
     installer::delete_stale_libraries();
 
+    let is_screenshot_run = args.iter().any(|a| a == "--screenshot-test");
     #[cfg(windows)]
-    let _mutex_guard = match acquire_single_instance_mutex() {
-        Some(h) => h,
-        None => {
-            show_windows_message(
-                "PulseGlass",
-                "PulseGlass zaten çalışıyor! (Ctrl+Enter ile Özet Modunu açıp kapatabilirsiniz.)",
-            );
-            return Ok(());
+    let _mutex_guard = if is_screenshot_run {
+        0isize
+    } else {
+        match acquire_single_instance_mutex() {
+            Some(h) => h,
+            None => {
+                show_windows_message(
+                    "PulseGlass",
+                    "PulseGlass zaten çalışıyor! (Ayarlı kısayol ile Özet Modunu açıp kapatabilirsiniz.)",
+                );
+                return Ok(());
+            }
         }
     };
 
