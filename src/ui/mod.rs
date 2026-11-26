@@ -1,22 +1,29 @@
 pub mod gauges;
 pub mod i18n;
+pub mod media_theme;
 
 use crate::hotkeys::{
     HotkeyAction, HotkeyManager, HotkeySpec, DEFAULT_GHOST_HOTKEY, DEFAULT_SUMMARY_HOTKEY,
 };
 use crate::installer::{
-    install_current_to_system, is_autostart_enabled, is_system_installed, open_file_location,
-    open_url_non_elevated, set_autostart, uninstall_from_system, APP_VERSION,
+    install_current_to_system, install_pawnio_driver, is_autostart_enabled, is_system_installed,
+    open_file_location, open_url_non_elevated, set_autostart, uninstall_from_system, APP_VERSION,
 };
 use crate::models::{HardwareSnapshot, UpdateCheckResult};
-use crate::settings::{is_portable_mode, load_settings, parse_hex_color, save_settings, AppSettings};
-use crate::telemetry::{kill_process_by_pid, TelemetryHandle};
+use crate::settings::{
+    color_to_hex, is_portable_mode, load_settings, parse_hex_color, save_settings, AppSettings,
+};
+use crate::telemetry::{kill_processes_by_pids, TelemetryHandle};
 use crate::updater::{
     check_app_update_only, download_and_apply_app_update, install_windows_updates,
     populate_os_updates,
 };
 use gauges::{draw_circular_gauge, draw_shadowed_osd_text, glass_card};
 use i18n::I18n;
+use media_theme::{
+    extract_theme_from_rgba, pick_media_file, BackgroundMediaPlayer, ExtractedPalette,
+    THEME_PRESETS,
+};
 
 use egui::{Color32, RichText, Rounding, Stroke, Vec2, ViewportCommand};
 use std::sync::atomic::Ordering;
@@ -36,6 +43,7 @@ enum DetailTab {
     Overview,
     Hardware,
     Processes,
+    Themes,
     Settings,
     Updates,
 }
@@ -48,8 +56,78 @@ enum ProcSort {
     Name,
 }
 
+#[derive(Default)]
+struct SmoothedMetrics {
+    seeded: bool,
+    cpu_pct: f32,
+    gpu_pct: f32,
+    igpu_pct: f32,
+    ram_pct: f32,
+    cpu_clock: f32,
+    gpu_watts: f32,
+    device_watts: f32,
+    net_down: f32,
+    net_up: f32,
+    core_loads: Vec<f32>,
+}
+
+impl SmoothedMetrics {
+    fn step(&mut self, snap: &HardwareSnapshot, dt: f32) -> bool {
+        if !self.seeded && snap.ram.total_gb > 0.1 {
+            self.seeded = true;
+            self.cpu_pct = snap.cpu.usage_percent;
+            self.gpu_pct = snap.gpu.usage_percent;
+            self.igpu_pct = snap.igpu.usage_percent;
+            self.ram_pct = snap.ram.usage_percent;
+            self.cpu_clock = snap.cpu.current_clock_ghz;
+            self.gpu_watts = snap.gpu.power_watts.unwrap_or(0.0);
+            self.device_watts = snap.power.device_total_watts.unwrap_or(0.0);
+            self.net_down = snap.network.download_mbps;
+            self.net_up = snap.network.upload_mbps;
+            self.core_loads = snap.cpu.per_core_usage.clone();
+            return false;
+        }
+        if !self.seeded {
+            return false;
+        }
+        let alpha = (1.0 - (-dt.clamp(0.005, 0.25) * 8.5).exp()).clamp(0.05, 0.55);
+        let mut animating = false;
+        let mut lerp_to = |cur: &mut f32, target: f32| {
+            let diff = (target - *cur).abs();
+            if diff > 0.12 {
+                *cur += (target - *cur) * alpha;
+                animating = true;
+            } else {
+                *cur = target;
+            }
+        };
+        lerp_to(&mut self.cpu_pct, snap.cpu.usage_percent);
+        lerp_to(&mut self.gpu_pct, snap.gpu.usage_percent);
+        lerp_to(&mut self.igpu_pct, snap.igpu.usage_percent);
+        lerp_to(&mut self.ram_pct, snap.ram.usage_percent);
+        lerp_to(&mut self.cpu_clock, snap.cpu.current_clock_ghz);
+        lerp_to(&mut self.gpu_watts, snap.gpu.power_watts.unwrap_or(0.0));
+        lerp_to(
+            &mut self.device_watts,
+            snap.power.device_total_watts.unwrap_or(0.0),
+        );
+        lerp_to(&mut self.net_down, snap.network.download_mbps);
+        lerp_to(&mut self.net_up, snap.network.upload_mbps);
+
+        if self.core_loads.len() != snap.cpu.per_core_usage.len() {
+            self.core_loads = snap.cpu.per_core_usage.clone();
+        } else {
+            for (c, &t) in self.core_loads.iter_mut().zip(snap.cpu.per_core_usage.iter()) {
+                lerp_to(c, t);
+            }
+        }
+        animating
+    }
+}
+
 pub struct PulseGlassApp {
     settings: AppSettings,
+    settings_saved_snapshot: AppSettings,
     mode: ViewMode,
     prev_non_summary_mode: ViewMode,
     tab: DetailTab,
@@ -62,9 +140,23 @@ pub struct PulseGlassApp {
     capturing_hotkey: Option<HotkeyAction>,
     hotkey_notice: String,
 
+    // Smooth value animation & safe scaling
+    smoothed: SmoothedMetrics,
+    last_frame_time: Instant,
+    applied_zoom: f32,
+
+    // Theme & Media backgrounds (separate or synced between Widget & Window)
+    widget_bg_player: BackgroundMediaPlayer,
+    window_bg_player: BackgroundMediaPlayer,
+
+    // Integrated PawnIO installer feedback
+    pawnio_installing: Arc<std::sync::atomic::AtomicBool>,
+    pawnio_status_msg: Arc<RwLock<String>>,
+
     // Process view state
     proc_search: String,
     proc_sort: ProcSort,
+    proc_sort_asc: bool,
     proc_group: bool,
 
     // Updates state
@@ -396,17 +488,20 @@ impl PulseGlassApp {
             Some("summary") => (ViewMode::SummaryOsd, DetailTab::Overview),
             Some("detailed") => (ViewMode::DetailedWidget, DetailTab::Overview),
             Some("hardware") => (ViewMode::DetailedWidget, DetailTab::Hardware),
+            Some("themes") => (ViewMode::DetailedWidget, DetailTab::Themes),
             Some("settings") => (ViewMode::DetailedWidget, DetailTab::Settings),
             Some("updates") => (ViewMode::DetailedWidget, DetailTab::Updates),
             Some("window") => (ViewMode::FullWindow, DetailTab::Overview),
             _ => (ViewMode::CompactWidget, DetailTab::Overview),
         };
 
+        let saved_copy = settings.clone();
         Self {
             autostart_enabled: is_autostart_enabled(),
             is_installed: is_system_installed(),
             is_portable: is_portable_mode(),
             settings,
+            settings_saved_snapshot: saved_copy,
             mode: initial_mode,
             prev_non_summary_mode: ViewMode::CompactWidget,
             tab: initial_tab,
@@ -417,8 +512,16 @@ impl PulseGlassApp {
             hotkeys,
             capturing_hotkey: None,
             hotkey_notice: String::new(),
+            smoothed: SmoothedMetrics::default(),
+            last_frame_time: Instant::now(),
+            applied_zoom: 1.0,
+            widget_bg_player: BackgroundMediaPlayer::default(),
+            window_bg_player: BackgroundMediaPlayer::default(),
+            pawnio_installing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pawnio_status_msg: Arc::new(RwLock::new(String::new())),
             proc_search: String::new(),
             proc_sort: ProcSort::Cpu,
+            proc_sort_asc: false,
             proc_group: true,
             update_result: Arc::new(RwLock::new(None)),
             checking_updates: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -611,6 +714,70 @@ impl PulseGlassApp {
         parse_hex_color(&self.settings.bg_hex, Color32::from_rgb(20, 14, 22))
     }
 
+    fn card_base_color(&self) -> Color32 {
+        parse_hex_color(&self.settings.card_hex, Color32::from_rgb(34, 27, 38))
+    }
+
+    fn text_base_color(&self) -> Color32 {
+        parse_hex_color(&self.settings.text_hex, Color32::from_rgb(255, 241, 235))
+    }
+
+    fn apply_extracted_palette(&mut self, pal: &ExtractedPalette) {
+        self.settings.primary_hex = pal.primary_hex.clone();
+        self.settings.secondary_hex = pal.secondary_hex.clone();
+        self.settings.bg_hex = pal.bg_hex.clone();
+        self.settings.card_hex = pal.card_hex.clone();
+        self.settings.text_hex = pal.text_hex.clone();
+        self.settings.custom_theme_name = "Otomatik (Görsel)".to_string();
+    }
+
+    fn apply_all_live_settings(&mut self, ctx: &egui::Context) {
+        self.telemetry
+            .refresh_ms
+            .store(self.settings.refresh_ms.clamp(500, 10_000), Ordering::Relaxed);
+        if let Ok(mut g) = self.telemetry.thresholds.write() {
+            *g = (
+                self.settings.cpu_temp_thresh,
+                self.settings.gpu_temp_thresh,
+                self.settings.cpu_use_thresh,
+                self.settings.ram_use_thresh,
+            );
+        }
+        self.hotkeys
+            .rebind(&self.settings.hotkey_summary, &self.settings.hotkey_ghost);
+        self.apply_window_geometry(ctx);
+    }
+
+    fn trigger_pawnio_install(&self, ctx: &egui::Context, en: bool) {
+        if self.pawnio_installing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let flag = Arc::clone(&self.pawnio_installing);
+        let msg_arc = Arc::clone(&self.pawnio_status_msg);
+        if let Ok(mut g) = msg_arc.write() {
+            *g = if en {
+                "Downloading & installing signed PawnIO driver...".to_string()
+            } else {
+                "İmzalı PawnIO sürücüsü indiriliyor ve kuruluyor...".to_string()
+            };
+        }
+        let ctx_bg = ctx.clone();
+        std::thread::Builder::new()
+            .name("pulseglass-pawnio-setup".to_string())
+            .spawn(move || {
+                let res = match install_pawnio_driver(en) {
+                    Ok(m) => m,
+                    Err(e) => e,
+                };
+                if let Ok(mut g) = msg_arc.write() {
+                    *g = res;
+                }
+                flag.store(false, Ordering::SeqCst);
+                ctx_bg.request_repaint();
+            })
+            .ok();
+    }
+
     /// Independent opacities:
     /// - Summary OSD: ALWAYS completely transparent (0 alpha)
     /// - Compact/Detailed Widget: uses settings.widget_opacity ONLY
@@ -648,18 +815,28 @@ impl PulseGlassApp {
     }
 
     fn apply_window_geometry(&mut self, ctx: &egui::Context) {
-        let s = self.settings.ui_scale.clamp(0.85, 1.35);
-        if (s - 1.0).abs() > 0.01 {
-            ctx.set_zoom_factor(s);
+        // Scale ALL interfaces proportionally with ui_scale EXCEPT Summary OSD (always 1.0 zoom, uses summary_font_size!)
+        let s = if self.mode == ViewMode::SummaryOsd {
+            1.0
         } else {
-            ctx.set_zoom_factor(1.0);
-        }
+            self.settings.ui_scale.clamp(0.85, 1.35)
+        };
+        let mon = ctx.input(|i| i.viewport().monitor_size);
+        let cap_size = |w: f32, h: f32| -> Vec2 {
+            let mut sw = (w * s).round();
+            let mut sh = (h * s).round();
+            if let Some(m) = mon {
+                sw = sw.min((m.x - 24.0).max(320.0));
+                sh = sh.min((m.y - 48.0).max(220.0));
+            }
+            Vec2::new(sw, sh)
+        };
 
         match self.mode {
             ViewMode::SummaryOsd => {
                 ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(520.0, 32.0)));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(520.0, 34.0)));
                 #[cfg(windows)]
                 apply_win32_z_order("PulseGlass Hardware Monitor", true, false);
             }
@@ -673,7 +850,7 @@ impl PulseGlassApp {
                     egui::WindowLevel::Normal
                 };
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(lvl));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(520.0, 294.0)));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(cap_size(520.0, 294.0)));
                 if let (Some(x), Some(y)) = (self.settings.pos_x, self.settings.pos_y) {
                     if x > -5000.0 && y > -5000.0 {
                         ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
@@ -696,7 +873,7 @@ impl PulseGlassApp {
                     egui::WindowLevel::Normal
                 };
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(lvl));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(660.0, 580.0)));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(cap_size(680.0, 580.0)));
                 #[cfg(windows)]
                 apply_win32_z_order(
                     "PulseGlass Hardware Monitor",
@@ -708,7 +885,7 @@ impl PulseGlassApp {
                 self.settings.desktop_pinned = false;
                 ctx.send_viewport_cmd(ViewportCommand::Resizable(true));
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(900.0, 640.0)));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(cap_size(900.0, 640.0)));
                 #[cfg(windows)]
                 apply_win32_z_order("PulseGlass Hardware Monitor", false, false);
             }
@@ -896,7 +1073,7 @@ impl eframe::App for PulseGlassApp {
                 .unwrap_or(false);
             let data_ready = match self.screenshot_mode.as_deref() {
                 Some("updates") => updates_ready || self.last_update_check.elapsed() > Duration::from_secs(7),
-                Some("settings") => self.frame_count >= 6,
+                Some("settings") | Some("themes") => self.frame_count >= 6,
                 _ => (snap_ready && self.frame_count >= 10) || self.last_update_check.elapsed() > Duration::from_secs(5),
             };
             if !self.screenshot_requested && data_ready {
@@ -1065,6 +1242,66 @@ impl eframe::App for PulseGlassApp {
         let tr = I18n::new(self.settings.language.eq_ignore_ascii_case("en"));
         let primary = self.primary_color();
         let secondary = self.secondary_color();
+        let card_col = self.card_base_color();
+        let text_col = self.text_base_color();
+
+        // Safe frame-start UI zoom (ONLY applied before layout, NEVER mid-drag! Summary OSD is ALWAYS 1.0)
+        let desired_zoom = if self.mode == ViewMode::SummaryOsd {
+            1.0
+        } else {
+            self.settings.ui_scale.clamp(0.85, 1.35)
+        };
+        if (desired_zoom - self.applied_zoom).abs() > 0.005 {
+            self.applied_zoom = desired_zoom;
+            ctx.set_zoom_factor(desired_zoom);
+        }
+
+        // Apply custom card & text theme colors dynamically
+        ctx.style_mut(|st| {
+            st.visuals.extreme_bg_color = card_col;
+            st.visuals.override_text_color = Some(text_col);
+        });
+
+        // Smooth value transitions (frame-rate independent exponential interpolation)
+        let now_frame = Instant::now();
+        let dt = now_frame
+            .duration_since(self.last_frame_time)
+            .as_secs_f32()
+            .clamp(0.005, 0.25);
+        self.last_frame_time = now_frame;
+        if self.smoothed.step(&snap, dt) {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
+        // Sync background media loaders (same or separate for Widget vs Window)
+        let widget_path = self.settings.widget_bg_media.clone();
+        let window_path = if self.settings.bg_sync_modes {
+            self.settings.widget_bg_media.clone()
+        } else {
+            self.settings.window_bg_media.clone()
+        };
+        let widget_changed = self
+            .widget_bg_player
+            .load_if_changed(ctx, &widget_path, "widget", tr.en);
+        let window_changed = if self.settings.bg_sync_modes {
+            false
+        } else {
+            self.window_bg_player
+                .load_if_changed(ctx, &window_path, "window", tr.en)
+        };
+        if self.settings.auto_theme_from_bg {
+            if widget_changed {
+                if let Some(ref rgba) = self.widget_bg_player.first_frame_rgba {
+                    let pal = extract_theme_from_rgba(rgba);
+                    self.apply_extracted_palette(&pal);
+                }
+            } else if window_changed {
+                if let Some(ref rgba) = self.window_bg_player.first_frame_rgba {
+                    let pal = extract_theme_from_rgba(rgba);
+                    self.apply_extracted_palette(&pal);
+                }
+            }
+        }
 
         // Continue active Win32 drag smoothly every frame until mouse button released
         self.tick_window_drag(ctx);
@@ -1077,22 +1314,21 @@ impl eframe::App for PulseGlassApp {
             self.begin_window_drag(ctx);
         }
 
-        // 4. PURE SUMMARY OSD MODE — ONLY selected values, ZERO chrome, ALWAYS transparent, instant left-drag!
+        // 4. PURE SUMMARY OSD MODE — ONLY selected values, ZERO chrome, ALWAYS transparent, custom font size!
         if self.mode == ViewMode::SummaryOsd {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
                 .show(ctx, |ui| {
                     let line = self.build_summary_line(&snap, &tr);
-                    let (rect, resp) = draw_shadowed_osd_text(
-                        ui,
-                        &line,
-                        Color32::from_rgb(255, 228, 214),
-                        13.5,
-                    );
+                    let font_sz = self.settings.summary_font_size.clamp(9.0, 28.0);
+                    let (rect, resp) = draw_shadowed_osd_text(ui, &line, text_col, font_sz);
                     if !self.ghost_mode && (resp.hovered() && primary_pressed) {
                         self.begin_window_drag(ctx);
                     }
-                    let target = Vec2::new((rect.width() + 12.0).max(140.0), (rect.height() + 6.0).max(26.0));
+                    let target = Vec2::new(
+                        (rect.width() + 14.0).max(140.0),
+                        (rect.height() + 8.0).max(24.0),
+                    );
                     if (target - self.last_osd_size).length() > 3.0 {
                         self.last_osd_size = target;
                         ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
@@ -1102,22 +1338,53 @@ impl eframe::App for PulseGlassApp {
             return;
         }
 
-        // 5. GLASSMORPHIC FRAME FOR WIDGET & WINDOW MODES
-        let bg_fill = self.active_bg_color();
+        // 5. GLASSMORPHIC FRAME FOR WIDGET & WINDOW MODES (+ optional Image/GIF/Video Background)
+        let use_window_bg = self.mode == ViewMode::FullWindow && !self.settings.bg_sync_modes;
+        let has_bg_media = if use_window_bg {
+            self.window_bg_player.is_loaded()
+        } else {
+            self.widget_bg_player.is_loaded()
+        };
+        let active_opacity = if self.mode == ViewMode::FullWindow {
+            self.settings.window_opacity.clamp(0.35, 1.0)
+        } else {
+            self.settings.widget_opacity.clamp(0.25, 1.0)
+        };
+        let bg_fill = if has_bg_media {
+            Color32::TRANSPARENT
+        } else {
+            self.active_bg_color()
+        };
         let border_color = if !snap.alerts.is_empty() {
             primary
         } else {
-            Color32::from_rgba_unmultiplied(secondary.r(), secondary.g(), secondary.b(), 82)
+            Color32::from_rgba_unmultiplied(secondary.r(), secondary.g(), secondary.b(), 88)
         };
+        let rounding = Rounding::same(if self.mode == ViewMode::FullWindow {
+            self.settings.corner_radius.clamp(4.0, 24.0).min(14.0)
+        } else {
+            self.settings.corner_radius.clamp(4.0, 24.0)
+        });
+        let border_w = self.settings.border_width.clamp(0.5, 3.0);
+
+        if has_bg_media {
+            let screen_rect = ctx.screen_rect().shrink(4.0);
+            let bg_painter = ctx.layer_painter(egui::LayerId::background());
+            let fit = self.settings.bg_media_fit.clone();
+            let dim = self.settings.bg_media_dim;
+            if use_window_bg {
+                self.window_bg_player
+                    .paint(ctx, &bg_painter, screen_rect, &fit, dim, active_opacity, rounding);
+            } else {
+                self.widget_bg_player
+                    .paint(ctx, &bg_painter, screen_rect, &fit, dim, active_opacity, rounding);
+            }
+        }
 
         let frame = egui::Frame::none()
             .fill(bg_fill)
-            .stroke(Stroke::new(1.1_f32, border_color))
-            .rounding(Rounding::same(if self.mode == ViewMode::FullWindow {
-                10.0
-            } else {
-                16.0
-            }))
+            .stroke(Stroke::new(border_w, border_color))
+            .rounding(rounding)
             .outer_margin(egui::Margin::same(4.0))
             .inner_margin(egui::Margin::symmetric(14.0, 11.0));
 
@@ -1356,7 +1623,7 @@ impl PulseGlassApp {
                 draw_circular_gauge(
                     ui,
                     76.0,
-                    snap.cpu.usage_percent,
+                    self.smoothed.cpu_pct,
                     "CPU",
                     &snap.cpu.temp_text(),
                     secondary,
@@ -1366,7 +1633,7 @@ impl PulseGlassApp {
                 ui.add_space(2.0);
                 ui.label(RichText::new("CPU").strong().size(11.5).color(Color32::from_rgb(255, 232, 224)));
                 ui.label(
-                    RichText::new(format!("{:.2} GHz", snap.cpu.current_clock_ghz))
+                    RichText::new(format!("{:.2} GHz", self.smoothed.cpu_clock))
                         .size(10.5)
                         .color(secondary),
                 );
@@ -1376,7 +1643,7 @@ impl PulseGlassApp {
                 draw_circular_gauge(
                     ui,
                     76.0,
-                    snap.gpu.usage_percent,
+                    self.smoothed.gpu_pct,
                     "GPU",
                     &snap.gpu.temp_text(),
                     secondary,
@@ -1401,7 +1668,7 @@ impl PulseGlassApp {
                 draw_circular_gauge(
                     ui,
                     76.0,
-                    if snap.igpu.is_available { snap.igpu.usage_percent } else { 0.0 },
+                    if snap.igpu.is_available { self.smoothed.igpu_pct } else { 0.0 },
                     "iGPU",
                     &igpu_temp,
                     secondary,
@@ -1427,7 +1694,7 @@ impl PulseGlassApp {
                 draw_circular_gauge(
                     ui,
                     76.0,
-                    snap.ram.usage_percent,
+                    self.smoothed.ram_pct,
                     "RAM",
                     &ram_sub,
                     secondary,
@@ -1526,8 +1793,9 @@ impl PulseGlassApp {
             ui.spacing_mut().item_spacing.x = 6.0;
             let tabs = [
                 (DetailTab::Overview, tr.t("Genel Bakış", "Overview")),
-                (DetailTab::Hardware, tr.t("Donanım", "Hardware Details")),
+                (DetailTab::Hardware, tr.t("Donanım", "Hardware")),
                 (DetailTab::Processes, tr.t("Uygulamalar", "Processes")),
+                (DetailTab::Themes, tr.t("Tema", "Themes")),
                 (DetailTab::Settings, tr.t("Ayarlar", "Settings")),
                 (DetailTab::Updates, tr.t("Güncellemeler", "Updates")),
             ];
@@ -1543,8 +1811,9 @@ impl PulseGlassApp {
             .auto_shrink([false, false])
             .show(ui, |ui| match self.tab {
                 DetailTab::Overview => self.render_tab_overview(ui, snap, tr, primary, secondary),
-                DetailTab::Hardware => self.render_tab_hardware(ui, snap, tr, primary, secondary),
+                DetailTab::Hardware => self.render_tab_hardware(ui, ctx, snap, tr, primary, secondary),
                 DetailTab::Processes => self.render_tab_processes(ui, snap, tr, primary, secondary),
+                DetailTab::Themes => self.render_tab_themes(ui, ctx, tr, primary, secondary),
                 DetailTab::Settings => self.render_tab_settings(ui, ctx, tr, primary, secondary),
                 DetailTab::Updates => self.render_tab_updates(ui, ctx, tr, primary, secondary),
             });
@@ -1565,7 +1834,7 @@ impl PulseGlassApp {
                     draw_circular_gauge(
                         ui,
                         82.0,
-                        snap.cpu.usage_percent,
+                        self.smoothed.cpu_pct,
                         "CPU",
                         &snap.cpu.temp_text(),
                         secondary,
@@ -1577,7 +1846,7 @@ impl PulseGlassApp {
                     ui.label(
                         RichText::new(format!(
                             "{:.2} GHz ({}C/{}T)",
-                            snap.cpu.current_clock_ghz, snap.cpu.physical_cores, snap.cpu.logical_processors
+                            self.smoothed.cpu_clock, snap.cpu.physical_cores, snap.cpu.logical_processors
                         ))
                         .size(10.0)
                         .color(secondary),
@@ -1590,7 +1859,7 @@ impl PulseGlassApp {
                     draw_circular_gauge(
                         ui,
                         82.0,
-                        snap.gpu.usage_percent,
+                        self.smoothed.gpu_pct,
                         "GPU",
                         &snap.gpu.temp_text(),
                         secondary,
@@ -1613,7 +1882,7 @@ impl PulseGlassApp {
                     draw_circular_gauge(
                         ui,
                         82.0,
-                        if snap.igpu.is_available { snap.igpu.usage_percent } else { 0.0 },
+                        if snap.igpu.is_available { self.smoothed.igpu_pct } else { 0.0 },
                         "iGPU",
                         &igpu_t,
                         secondary,
@@ -1641,7 +1910,7 @@ impl PulseGlassApp {
                     draw_circular_gauge(
                         ui,
                         82.0,
-                        snap.ram.usage_percent,
+                        self.smoothed.ram_pct,
                         "RAM",
                         &ram_sub,
                         secondary,
@@ -1759,9 +2028,14 @@ impl PulseGlassApp {
                 .color(secondary),
             );
             ui.add_space(4.0);
-            let cols = if snap.cpu.per_core_usage.len() > 8 { 4 } else { 2 };
+            let core_slice: &[f32] = if self.smoothed.core_loads.len() == snap.cpu.per_core_usage.len() {
+                &self.smoothed.core_loads
+            } else {
+                &snap.cpu.per_core_usage
+            };
+            let cols = if core_slice.len() > 8 { 4 } else { 2 };
             egui::Grid::new("core_grid").num_columns(cols).spacing([10.0, 4.0]).show(ui, |ui| {
-                for (i, &u) in snap.cpu.per_core_usage.iter().enumerate() {
+                for (i, &u) in core_slice.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("C{:02}", i)).size(10.0).color(Color32::GRAY));
                         let bar = egui::ProgressBar::new((u / 100.0).clamp(0.0, 1.0))
@@ -1782,6 +2056,7 @@ impl PulseGlassApp {
     fn render_tab_hardware(
         &mut self,
         ui: &mut egui::Ui,
+        ctx: &egui::Context,
         snap: &HardwareSnapshot,
         tr: &I18n,
         primary: Color32,
@@ -1808,21 +2083,59 @@ impl PulseGlassApp {
             );
 
             #[cfg(windows)]
-            if !snap.pawnio_installed {
-                ui.add_space(3.0);
-                ui.horizontal_wrapped(|ui| {
+            {
+                ui.add_space(4.0);
+                let installing = self.pawnio_installing.load(Ordering::Relaxed);
+                let p_msg = self
+                    .pawnio_status_msg
+                    .read()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                if snap.pawnio_installed {
                     ui.label(
                         RichText::new(tr.t(
-                            "Not: Gelişmiş CPU çekirdek sıcaklığı için PawnIO sürücüsü önerilir (WinRing0 yerine):",
-                            "Note: For detailed CPU core temperatures, install the PawnIO driver (replaces WinRing0):",
+                            "✓ PawnIO Donanım Sürücüsü aktif (CPU Watt & Çekirdek Sıcaklığı — WinRing0 yok).",
+                            "✓ PawnIO Hardware Driver active (CPU Watts & Core Temp — zero WinRing0).",
                         ))
                         .size(10.5)
-                        .color(secondary),
+                        .color(Color32::from_rgb(110, 231, 183)),
                     );
-                    if ui.link(RichText::new("pawnio.eu").size(10.5).color(primary)).clicked() {
-                        open_url_non_elevated("https://pawnio.eu");
-                    }
-                });
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(tr.t(
+                                "Kesin donanım CPU Watt & çekirdek sıcaklığı için dahili PawnIO sürücüsü (WinRing0 yerine):",
+                                "For exact hardware CPU Watts & core temps, install integrated PawnIO (replaces WinRing0):",
+                            ))
+                            .size(10.5)
+                            .color(secondary),
+                        );
+                        if ui
+                            .add_enabled(
+                                !installing,
+                                egui::Button::new(
+                                    RichText::new(if installing {
+                                        tr.t("Kuruluyor...", "Installing...")
+                                    } else {
+                                        tr.t("PawnIO Sürücüsünü Kur", "Install PawnIO Driver")
+                                    })
+                                    .strong()
+                                    .size(10.5)
+                                    .color(primary),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.trigger_pawnio_install(ctx, tr.en);
+                        }
+                        if ui.link(RichText::new("pawnio.eu").size(10.0).color(secondary)).clicked() {
+                            open_url_non_elevated("https://pawnio.eu");
+                        }
+                    });
+                }
+                if !p_msg.is_empty() {
+                    ui.label(RichText::new(p_msg).size(10.0).color(secondary));
+                }
             }
         });
 
@@ -1938,12 +2251,20 @@ impl PulseGlassApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(format!("• {}", d.model)).strong().size(11.5).color(Color32::from_rgb(255, 241, 235)));
                         egui::Frame::none()
-                            .fill(Color32::from_rgb(70, 28, 42))
-                            .stroke(Stroke::new(1.0_f32, primary))
+                            .fill(Color32::from_rgba_unmultiplied(48, 42, 58, 220))
+                            .stroke(Stroke::new(
+                                0.9_f32,
+                                Color32::from_rgba_unmultiplied(
+                                    secondary.r(),
+                                    secondary.g(),
+                                    secondary.b(),
+                                    135,
+                                ),
+                            ))
                             .rounding(Rounding::same(5.0))
                             .inner_margin(egui::Margin::symmetric(6.0, 1.0))
                             .show(ui, |ui| {
-                                ui.label(RichText::new(&d.interface_label).strong().size(10.0).color(Color32::WHITE));
+                                ui.label(RichText::new(&d.interface_label).strong().size(10.0).color(secondary));
                             });
                         ui.label(
                             RichText::new(format!(
@@ -1981,9 +2302,9 @@ impl PulseGlassApp {
         primary: Color32,
         secondary: Color32,
     ) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(tr.t("Ara:", "Search:"));
-            ui.add(egui::TextEdit::singleline(&mut self.proc_search).desired_width(150.0));
+            ui.add(egui::TextEdit::singleline(&mut self.proc_search).desired_width(145.0));
             ui.checkbox(&mut self.proc_group, tr.t("Grupla", "Group"));
             egui::ComboBox::from_id_salt("proc_sort")
                 .selected_text(match self.proc_sort {
@@ -1998,12 +2319,20 @@ impl PulseGlassApp {
                     ui.selectable_value(&mut self.proc_sort, ProcSort::Disk, "Disk");
                     ui.selectable_value(&mut self.proc_sort, ProcSort::Name, tr.t("Ad", "Name"));
                 });
+            let dir_lbl = if self.proc_sort_asc {
+                tr.t("Azdan Çoğa ▲", "Ascending ▲")
+            } else {
+                tr.t("Çoktan Aza ▼", "Descending ▼")
+            };
+            if ui.button(RichText::new(dir_lbl).size(10.5).color(secondary)).clicked() {
+                self.proc_sort_asc = !self.proc_sort_asc;
+            }
         });
 
         ui.label(
             RichText::new(tr.t(
-                "İpucu: Bir uygulamaya sağ tıklayarak dosya konumunu açabilir, yolunu kopyalayabilir veya görevi sonlandırabilirsiniz.",
-                "Tip: Right-click any process to open file location, copy path, or terminate.",
+                "İpucu: Sütun başlıklarına tıklayarak sıralayabilir, bir uygulamaya sağ tıklayarak dosya konumunu açabilir veya görevi sonlandırabilirsiniz.",
+                "Tip: Click column headers to sort, or right-click any process to open file location, copy path, or terminate.",
             ))
             .size(10.0)
             .color(Color32::from_rgb(155, 168, 185)),
@@ -2017,22 +2346,38 @@ impl PulseGlassApp {
             .filter(|p| q.is_empty() || p.name.to_lowercase().contains(&q))
             .collect();
 
-        match self.proc_sort {
-            ProcSort::Cpu => list.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent)),
-            ProcSort::Ram => list.sort_by(|a, b| b.ram_mb.total_cmp(&a.ram_mb)),
-            ProcSort::Disk => list.sort_by(|a, b| b.disk_mbps.total_cmp(&a.disk_mbps)),
-            ProcSort::Name => list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-        }
+        let asc = self.proc_sort_asc;
+        list.sort_by(|a, b| {
+            let ord = match self.proc_sort {
+                ProcSort::Cpu => a.cpu_percent.total_cmp(&b.cpu_percent),
+                ProcSort::Ram => a.ram_mb.total_cmp(&b.ram_mb),
+                ProcSort::Disk => a.disk_mbps.total_cmp(&b.disk_mbps),
+                ProcSort::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            };
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
 
         // Reserve room for Frame horizontal margins (16px) + ScrollArea bar (14px) + 3 column gaps (18px)
         let avail_w = (ui.available_width() - 14.0).max(340.0);
         let inner_w = (avail_w - 16.0).max(320.0);
-        let col_cpu = 58.0;
+        let col_cpu = 62.0;
         let col_ram = 76.0;
-        let col_disk = 74.0;
+        let col_disk = 76.0;
         let col_name = (inner_w - col_cpu - col_ram - col_disk - 18.0).max(110.0);
 
-        // Table Header
+        // Clickable Sortable Table Header
+        let arrow = |col: ProcSort| -> &'static str {
+            if self.proc_sort == col {
+                if self.proc_sort_asc { " ▲" } else { " ▼" }
+            } else {
+                ""
+            }
+        };
+        let mut clicked_col: Option<ProcSort> = None;
         egui::Frame::none()
             .fill(Color32::from_rgb(46, 26, 38))
             .rounding(Rounding::same(6.0))
@@ -2041,12 +2386,77 @@ impl PulseGlassApp {
                 ui.set_width(inner_w);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.add_sized([col_name, 16.0], egui::Label::new(RichText::new(tr.t("Uygulama", "Process")).strong().size(11.0).color(secondary)).truncate());
-                    ui.add_sized([col_cpu, 16.0], egui::Label::new(RichText::new("CPU").strong().size(11.0).color(secondary)));
-                    ui.add_sized([col_ram, 16.0], egui::Label::new(RichText::new("RAM").strong().size(11.0).color(secondary)));
-                    ui.add_sized([col_disk, 16.0], egui::Label::new(RichText::new("Disk").strong().size(11.0).color(secondary)));
+                    if ui
+                        .add_sized(
+                            [col_name, 16.0],
+                            egui::Label::new(
+                                RichText::new(format!("{}{}", tr.t("Uygulama", "Process"), arrow(ProcSort::Name)))
+                                    .strong()
+                                    .size(11.0)
+                                    .color(secondary),
+                            )
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        clicked_col = Some(ProcSort::Name);
+                    }
+                    if ui
+                        .add_sized(
+                            [col_cpu, 16.0],
+                            egui::Label::new(
+                                RichText::new(format!("CPU{}", arrow(ProcSort::Cpu)))
+                                    .strong()
+                                    .size(11.0)
+                                    .color(secondary),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        clicked_col = Some(ProcSort::Cpu);
+                    }
+                    if ui
+                        .add_sized(
+                            [col_ram, 16.0],
+                            egui::Label::new(
+                                RichText::new(format!("RAM{}", arrow(ProcSort::Ram)))
+                                    .strong()
+                                    .size(11.0)
+                                    .color(secondary),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        clicked_col = Some(ProcSort::Ram);
+                    }
+                    if ui
+                        .add_sized(
+                            [col_disk, 16.0],
+                            egui::Label::new(
+                                RichText::new(format!("Disk{}", arrow(ProcSort::Disk)))
+                                    .strong()
+                                    .size(11.0)
+                                    .color(secondary),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        clicked_col = Some(ProcSort::Disk);
+                    }
                 });
             });
+        if let Some(c) = clicked_col {
+            if self.proc_sort == c {
+                self.proc_sort_asc = !self.proc_sort_asc;
+            } else {
+                self.proc_sort = c;
+                self.proc_sort_asc = c == ProcSort::Name;
+            }
+        }
 
         ui.add_space(2.0);
 
@@ -2097,7 +2507,7 @@ impl PulseGlassApp {
                 egui::Id::new(("proc_row", p.pid, idx)),
                 egui::Sense::click(),
             );
-            let pid = p.pid;
+            let pids = p.pids.clone();
             let exe_path = p.exe_path.clone();
             let tr_open = tr.t("Dosya Konumunu Aç", "Open File Location").to_string();
             let tr_copy = tr.t("Dosya Yolunu Kopyala", "Copy File Path").to_string();
@@ -2126,11 +2536,338 @@ impl PulseGlassApp {
                     .button(RichText::new(tr_kill).strong().color(primary))
                     .clicked()
                 {
-                    let _ = kill_process_by_pid(pid);
+                    let _ = kill_processes_by_pids(&pids);
                     ui.close_menu();
                 }
             });
         }
+    }
+
+    fn render_tab_themes(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        tr: &I18n,
+        primary: Color32,
+        secondary: Color32,
+    ) {
+        // 1. Background Media Customization (Image / Animated GIF / Video — synced or separate Widget vs Window!)
+        glass_card(ui, secondary, |ui| {
+            ui.label(
+                RichText::new(tr.t(
+                    "ARKA PLAN MEDYASI (GÖRSEL / GIF / VİDEO)",
+                    "BACKGROUND MEDIA (IMAGE / GIF / VIDEO)",
+                ))
+                .strong()
+                .size(11.0)
+                .color(secondary),
+            );
+            ui.add_space(3.0);
+
+            ui.checkbox(
+                &mut self.settings.bg_sync_modes,
+                tr.t(
+                    "Widget ve Pencere modları için aynı arka planı kullan",
+                    "Use the same background for Widget & Window modes",
+                ),
+            );
+            ui.checkbox(
+                &mut self.settings.auto_theme_from_bg,
+                tr.t(
+                    "Görsel seçildiğinde tema renklerini otomatik uyarla",
+                    "Auto-adapt theme colors from selected media",
+                ),
+            );
+
+            ui.add_space(4.0);
+            // Widget (or Shared) Background Row
+            ui.horizontal_wrapped(|ui| {
+                let lbl = if self.settings.bg_sync_modes {
+                    tr.t("Ortak Arka Plan:", "Shared Background:")
+                } else {
+                    tr.t("Widget Arka Planı:", "Widget Background:")
+                };
+                ui.label(RichText::new(lbl).strong().size(11.0));
+                if ui.button(tr.t("Görsel / GIF / Video Seç...", "Pick Image / GIF / Video...")).clicked() {
+                    if let Some(p) = pick_media_file(tr.en) {
+                        self.settings.widget_bg_media = p;
+                        if self.settings.bg_sync_modes {
+                            self.settings.window_bg_media = self.settings.widget_bg_media.clone();
+                        }
+                    }
+                }
+                if !self.settings.widget_bg_media.is_empty()
+                    && ui.small_button(tr.t("Temizle", "Clear")).clicked()
+                {
+                    self.settings.widget_bg_media.clear();
+                    self.widget_bg_player.clear();
+                    if self.settings.bg_sync_modes {
+                        self.settings.window_bg_media.clear();
+                        self.window_bg_player.clear();
+                    }
+                }
+            });
+            if !self.settings.widget_bg_media.is_empty() {
+                ui.label(
+                    RichText::new(&self.settings.widget_bg_media)
+                        .size(9.5)
+                        .color(Color32::GRAY),
+                );
+            }
+            if !self.widget_bg_player.status_msg.is_empty() {
+                ui.label(
+                    RichText::new(&self.widget_bg_player.status_msg)
+                        .size(10.0)
+                        .color(secondary),
+                );
+            }
+
+            // Separate Window Background Row when unsynced
+            if !self.settings.bg_sync_modes {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(tr.t("Pencere Arka Planı:", "Window Background:")).strong().size(11.0));
+                    if ui.button(tr.t("Pencere İçin Seç...", "Pick for Window...")).clicked() {
+                        if let Some(p) = pick_media_file(tr.en) {
+                            self.settings.window_bg_media = p;
+                        }
+                    }
+                    if !self.settings.window_bg_media.is_empty()
+                        && ui.small_button(tr.t("Temizle", "Clear")).clicked()
+                    {
+                        self.settings.window_bg_media.clear();
+                        self.window_bg_player.clear();
+                    }
+                });
+                if !self.settings.window_bg_media.is_empty() {
+                    ui.label(
+                        RichText::new(&self.settings.window_bg_media)
+                            .size(9.5)
+                            .color(Color32::GRAY),
+                    );
+                }
+                if !self.window_bg_player.status_msg.is_empty() {
+                    ui.label(
+                        RichText::new(&self.window_bg_player.status_msg)
+                            .size(10.0)
+                            .color(secondary),
+                    );
+                }
+            }
+
+            ui.add_space(4.0);
+            ui.add(
+                egui::Slider::new(&mut self.settings.bg_media_dim, 0.0..=0.90)
+                    .text(tr.t("Arka Plan Karartma (Okunabilirlik)", "Background Dim Veil")),
+            );
+            ui.horizontal(|ui| {
+                ui.label(tr.t("Yerleşim:", "Fit Mode:"));
+                for (val, label) in [
+                    ("cover", tr.t("Kapla (Cover)", "Cover")),
+                    ("contain", tr.t("Sığdır (Contain)", "Contain")),
+                    ("stretch", tr.t("Uzat (Stretch)", "Stretch")),
+                ] {
+                    if ui
+                        .selectable_label(self.settings.bg_media_fit == val, label)
+                        .clicked()
+                    {
+                        self.settings.bg_media_fit = val.to_string();
+                    }
+                }
+            });
+
+            if let Some(rgba) = self
+                .widget_bg_player
+                .first_frame_rgba
+                .clone()
+                .or_else(|| self.window_bg_player.first_frame_rgba.clone())
+            {
+                ui.add_space(3.0);
+                if ui
+                    .button(
+                        RichText::new(tr.t(
+                            "Görselden Otomatik Tema Renklerini Uygula",
+                            "Extract & Apply Theme Colors from Media",
+                        ))
+                        .strong()
+                        .color(primary),
+                    )
+                    .clicked()
+                {
+                    let pal = extract_theme_from_rgba(&rgba);
+                    self.apply_extracted_palette(&pal);
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+
+        // 2. Expanded Curated Visual Themes (12 Presets with Color Swatches!)
+        glass_card(ui, secondary, |ui| {
+            ui.label(
+                RichText::new(tr.t("HAZIR GÖRSEL TEMALAR (12 TEMA)", "CURATED VISUAL THEMES (12 PRESETS)"))
+                    .strong()
+                    .size(11.0)
+                    .color(secondary),
+            );
+            ui.add_space(4.0);
+            egui::Grid::new("theme_presets_grid")
+                .num_columns(3)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    for (i, preset) in THEME_PRESETS.iter().enumerate() {
+                        let p_col = parse_hex_color(preset.primary, primary);
+                        let s_col = parse_hex_color(preset.secondary, secondary);
+                        let b_col = parse_hex_color(preset.bg, Color32::BLACK);
+                        let name = if tr.en { preset.name_en } else { preset.name_tr };
+                        let active = self.settings.primary_hex.eq_ignore_ascii_case(preset.primary)
+                            && self.settings.bg_hex.eq_ignore_ascii_case(preset.bg);
+
+                        let resp = egui::Frame::none()
+                            .fill(b_col)
+                            .stroke(Stroke::new(
+                                if active { 1.8_f32 } else { 1.0_f32 },
+                                if active { p_col } else { s_col },
+                            ))
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                            .show(ui, |ui| {
+                                ui.set_min_width(175.0);
+                                ui.horizontal(|ui| {
+                                    let (r1, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(r1.center(), 4.5, p_col);
+                                    let (r2, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(r2.center(), 4.5, s_col);
+                                    ui.label(
+                                        RichText::new(name)
+                                            .strong()
+                                            .size(10.5)
+                                            .color(Color32::from_rgb(245, 240, 242)),
+                                    );
+                                });
+                            })
+                            .response;
+                        let click = ui.interact(
+                            resp.rect,
+                            egui::Id::new(("theme_preset", i)),
+                            egui::Sense::click(),
+                        );
+                        if click.clicked() {
+                            self.settings.primary_hex = preset.primary.to_string();
+                            self.settings.secondary_hex = preset.secondary.to_string();
+                            self.settings.bg_hex = preset.bg.to_string();
+                            self.settings.card_hex = preset.card.to_string();
+                            self.settings.text_hex = preset.text.to_string();
+                            self.settings.custom_theme_name = name.to_string();
+                        }
+                        if (i + 1) % 3 == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+
+        ui.add_space(6.0);
+
+        // 3. Full Custom Theme Studio (Interactive Color Pickers + Geometry)
+        glass_card(ui, secondary, |ui| {
+            ui.label(
+                RichText::new(tr.t("KENDİ TEMANI OLUŞTUR (RENK & ŞEKİL)", "CUSTOM THEME STUDIO (COLORS & SHAPE)"))
+                    .strong()
+                    .size(11.0)
+                    .color(secondary),
+            );
+            ui.add_space(4.0);
+
+            let pick_row = |ui: &mut egui::Ui, label: &str, hex: &mut String, fallback: Color32| {
+                ui.horizontal(|ui| {
+                    let mut col = parse_hex_color(hex, fallback);
+                    if egui::color_picker::color_edit_button_srgba(
+                        ui,
+                        &mut col,
+                        egui::color_picker::Alpha::Opaque,
+                    )
+                    .changed()
+                    {
+                        *hex = color_to_hex(col);
+                    }
+                    ui.label(RichText::new(label).size(11.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(egui::TextEdit::singleline(hex).desired_width(74.0));
+                    });
+                });
+            };
+
+            ui.columns(2, |cols| {
+                pick_row(&mut cols[0], tr.t("Ana Vurgu Rengi", "Primary Accent"), &mut self.settings.primary_hex, primary);
+                pick_row(&mut cols[0], tr.t("İkincil / Kenarlık", "Secondary / Border"), &mut self.settings.secondary_hex, secondary);
+                pick_row(&mut cols[0], tr.t("Metin Rengi", "Text Color"), &mut self.settings.text_hex, Color32::WHITE);
+                pick_row(&mut cols[1], tr.t("Arka Plan Rengi", "Background Color"), &mut self.settings.bg_hex, Color32::from_rgb(20, 14, 22));
+                pick_row(&mut cols[1], tr.t("Kart Yüzey Rengi", "Card Surface"), &mut self.settings.card_hex, Color32::from_rgb(34, 27, 38));
+            });
+
+            ui.add_space(4.0);
+            ui.add(
+                egui::Slider::new(&mut self.settings.corner_radius, 4.0..=24.0)
+                    .text(tr.t("Köşe Yuvarlaklığı (px)", "Corner Radius (px)")),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.settings.border_width, 0.5..=3.0)
+                    .text(tr.t("Kenarlık Kalınlığı (px)", "Border Width (px)")),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.settings.widget_opacity, 0.25..=1.0)
+                    .text(tr.t("Widget Opaklığı", "Widget Opacity")),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.settings.window_opacity, 0.35..=1.0)
+                    .text(tr.t("Pencere Opaklığı", "Window Opacity")),
+            );
+
+            ui.add_space(6.0);
+            self.render_settings_action_bar(ui, ctx, tr, primary, secondary);
+        });
+    }
+
+    fn render_settings_action_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        tr: &I18n,
+        primary: Color32,
+        secondary: Color32,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button(RichText::new(tr.t("Ayarları Kaydet", "Save Settings")).strong().color(secondary))
+                .clicked()
+            {
+                save_settings(&self.settings);
+                self.settings_saved_snapshot = self.settings.clone();
+            }
+            if ui
+                .button(RichText::new(tr.t("Değişiklikleri İptal Et", "Cancel Changes")))
+                .clicked()
+            {
+                self.settings = self.settings_saved_snapshot.clone();
+                self.capturing_hotkey = None;
+                self.hotkey_notice.clear();
+                self.apply_all_live_settings(ctx);
+            }
+            if ui
+                .button(RichText::new(tr.t("İlk Haline Sıfırla", "Reset to Defaults")).color(primary))
+                .clicked()
+            {
+                self.settings = AppSettings::default();
+                self.widget_bg_player.clear();
+                self.window_bg_player.clear();
+                self.capturing_hotkey = None;
+                self.hotkey_notice.clear();
+                save_settings(&self.settings);
+                self.settings_saved_snapshot = self.settings.clone();
+                self.apply_all_live_settings(ctx);
+            }
+        });
     }
 
     fn render_tab_settings(
@@ -2277,8 +3014,8 @@ impl PulseGlassApp {
 
             ui.label(
                 RichText::new(tr.t(
-                    "İpucu: Değiştirmek için kısayol kutusuna tıklayın, yeni tuş kombinasyonuna basın (örn. Ctrl+Alt+S veya F9). İptal için Esc.",
-                    "Tip: Click a shortcut button and press your desired key combo (e.g. Ctrl+Alt+S or F9). Press Esc to cancel.",
+                    "İpucu: Kısayol kutusuna tıklayıp herhangi bir tek tuş veya kombinasyona basın (örn. Insert, F9, Ctrl+Alt+S, Win+G). İptal için Esc.",
+                    "Tip: Click a shortcut button and press ANY single key or combination (e.g. Insert, F9, Ctrl+Alt+S, Win+G). Press Esc to cancel.",
                 ))
                 .size(10.0)
                 .color(Color32::GRAY),
@@ -2294,7 +3031,7 @@ impl PulseGlassApp {
         ui.add_space(6.0);
 
         glass_card(ui, secondary, |ui| {
-            ui.label(RichText::new(tr.t("GÖRÜNÜM & BAĞIMSIZ ŞEFFAFLIK", "APPEARANCE & INDEPENDENT OPACITY")).strong().size(11.0).color(secondary));
+            ui.label(RichText::new(tr.t("GÖRÜNÜM, ÖLÇEKLEME & ŞEFFAFLIK", "APPEARANCE, SCALING & OPACITY")).strong().size(11.0).color(secondary));
             ui.horizontal(|ui| {
                 ui.label(tr.t("Dil / Language:", "Language / Dil:"));
                 if ui.selectable_label(self.settings.language == "tr", "Türkçe").clicked() {
@@ -2303,6 +3040,18 @@ impl PulseGlassApp {
                 if ui.selectable_label(self.settings.language == "en", "English").clicked() {
                     self.settings.language = "en".to_string();
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(
+                            RichText::new(tr.t("Tema & Arka Plan Stüdyosu →", "Open Theme & Media Studio →"))
+                                .strong()
+                                .color(primary),
+                        )
+                        .clicked()
+                    {
+                        self.tab = DetailTab::Themes;
+                    }
+                });
             });
 
             ui.add(
@@ -2329,10 +3078,36 @@ impl PulseGlassApp {
                 .color(Color32::GRAY),
             );
 
-            if ui
-                .add(egui::Slider::new(&mut self.settings.ui_scale, 0.85..=1.35).text(tr.t("Ölçek", "UI Scale")))
-                .changed()
-            {
+            ui.add_space(4.0);
+            // Crash-proof UI Scale: commits ONLY on drag_stopped / step button (NEVER mid-drag!) and excludes Summary OSD!
+            let mut scale_committed = false;
+            let scale_resp = ui.add(
+                egui::Slider::new(&mut self.settings.ui_scale, 0.85..=1.35)
+                    .step_by(0.05)
+                    .text(tr.t(
+                        "Arayüz Ölçeği (Özet Hariç)",
+                        "UI Scale (Excludes Summary OSD)",
+                    )),
+            );
+            if scale_resp.drag_stopped() || scale_resp.lost_focus() {
+                scale_committed = true;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(tr.t("Hızlı Ölçek:", "Quick Scale:")).size(10.5).color(Color32::GRAY));
+                for pct in [85u32, 95, 100, 110, 120, 130] {
+                    let val = pct as f32 / 100.0;
+                    let active = (self.settings.ui_scale - val).abs() < 0.02;
+                    if ui
+                        .selectable_label(active, format!("{}%", pct))
+                        .clicked()
+                    {
+                        self.settings.ui_scale = val;
+                        scale_committed = true;
+                    }
+                }
+            });
+            if scale_committed {
+                self.settings.ui_scale = self.settings.ui_scale.clamp(0.85, 1.35);
                 self.apply_window_geometry(ctx);
             }
 
@@ -2344,24 +3119,6 @@ impl PulseGlassApp {
                     .refresh_ms
                     .store(self.settings.refresh_ms, Ordering::Relaxed);
             }
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label(tr.t("Temalar:", "Themes:"));
-                let presets = [
-                    ("Nar Çiçeği", "#FF4D6D", "#FFB085", "#140E16"),
-                    ("Cyber Cyan", "#00E5FF", "#7C4DFF", "#0B101B"),
-                    ("Emerald", "#10B981", "#6EE7B7", "#0B1714"),
-                    ("Amber Gold", "#F59E0B", "#FDE68A", "#1A140B"),
-                    ("Monochrome", "#F8FAFC", "#94A3B8", "#0F1117"),
-                ];
-                for (name, p, s, b) in presets {
-                    if ui.small_button(name).clicked() {
-                        self.settings.primary_hex = p.to_string();
-                        self.settings.secondary_hex = s.to_string();
-                        self.settings.bg_hex = b.to_string();
-                    }
-                }
-            });
 
             if ui
                 .checkbox(&mut self.autostart_enabled, tr.t("Sistem açılışında otomatik başlat", "Launch automatically on startup"))
@@ -2375,11 +3132,17 @@ impl PulseGlassApp {
 
         glass_card(ui, secondary, |ui| {
             let sum_hdr = if tr.en {
-                format!("SUMMARY OSD ({}) METRICS", self.settings.hotkey_summary.to_uppercase())
+                format!("SUMMARY OSD ({}) METRICS & FONT SIZE", self.settings.hotkey_summary.to_uppercase())
             } else {
-                format!("ÖZET MODU ({}) DEĞERLERİ", self.settings.hotkey_summary.to_uppercase())
+                format!("ÖZET MODU ({}) DEĞERLERİ & PUNTO", self.settings.hotkey_summary.to_uppercase())
             };
             ui.label(RichText::new(sum_hdr).strong().size(11.0).color(secondary));
+            ui.add(
+                egui::Slider::new(&mut self.settings.summary_font_size, 9.0..=28.0)
+                    .step_by(0.5)
+                    .text(tr.t("Özet Punto Boyutu (pt)", "Summary Font Size (pt)")),
+            );
+            ui.add_space(3.0);
             ui.columns(2, |cols| {
                 cols[0].checkbox(&mut self.settings.sum_cpu_pct, "CPU %");
                 cols[0].checkbox(&mut self.settings.sum_cpu_temp, "CPU °C");
@@ -2390,14 +3153,14 @@ impl PulseGlassApp {
                 cols[1].checkbox(&mut self.settings.sum_ssd_temp, "SSD °C");
                 cols[1].checkbox(&mut self.settings.sum_gpu_watts, tr.t("GPU Watt (W)", "GPU Watts (W)"));
                 cols[1].checkbox(&mut self.settings.sum_device_watts, tr.t("Cihaz Watt (W)", "Device Watts (W)"));
-                cols[1].checkbox(&mut self.settings.sum_fps, "FPS (DXGI / RTSS)");
+                cols[1].checkbox(&mut self.settings.sum_fps, "FPS (ETW / RTSS)");
             });
         });
 
         ui.add_space(6.0);
 
         glass_card(ui, secondary, |ui| {
-            ui.label(RichText::new(tr.t("UYARI EŞİKLERİ", "ALERT THRESHOLDS")).strong().size(11.0).color(secondary));
+            ui.label(RichText::new(tr.t("UYARI EŞİKLERİ & AYAR YÖNETİMİ", "ALERT THRESHOLDS & SETTINGS ACTIONS")).strong().size(11.0).color(secondary));
             let mut changed = false;
             changed |= ui.add(egui::Slider::new(&mut self.settings.cpu_temp_thresh, 60.0..=105.0).text("CPU °C")).changed();
             changed |= ui.add(egui::Slider::new(&mut self.settings.gpu_temp_thresh, 60.0..=100.0).text("GPU °C")).changed();
@@ -2413,9 +3176,8 @@ impl PulseGlassApp {
                     );
                 }
             }
-            if ui.button(tr.t("Ayarları Kaydet", "Save Settings")).clicked() {
-                save_settings(&self.settings);
-            }
+            ui.add_space(6.0);
+            self.render_settings_action_bar(ui, ctx, tr, primary, secondary);
         });
     }
 
