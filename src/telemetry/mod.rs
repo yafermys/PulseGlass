@@ -75,8 +75,13 @@ fn run_worker(
     let mut disks_sys = Disks::new_with_refreshed_list();
     let mut networks = Networks::new_with_refreshed_list();
 
-    let pawnio = is_pawnio_installed();
+    let mut pawnio = is_pawnio_installed();
     let os_name = System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
+    let cpu_brand_init = sys
+        .cpus()
+        .first()
+        .map(|c| c.brand().trim().to_string())
+        .unwrap_or_default();
     #[cfg(windows)]
     let phys_ram_gb = windows::get_installed_ram_gb();
 
@@ -91,6 +96,8 @@ fn run_worker(
     let (reg_dgpu, reg_igpu) = windows::discover_gpus_from_registry();
     #[cfg(windows)]
     let mut emi = windows::EmiPowerReader::new();
+    #[cfg(windows)]
+    let mut pawnio_reader = windows::PawnIoReader::try_new(&cpu_brand_init);
     #[cfg(windows)]
     let etw_fps = windows::EtwFpsMonitor::start();
     #[cfg(windows)]
@@ -145,16 +152,35 @@ fn run_worker(
         snap.cpu.per_core_usage = cpus.iter().map(|c| c.cpu_usage()).collect();
 
         #[cfg(windows)]
+        let (pawnio_temp, pawnio_pkg_w, pawnio_psys_w) = {
+            if pawnio_reader.is_none() && tick % 8 == 0 {
+                pawnio = is_pawnio_installed();
+                if pawnio {
+                    pawnio_reader = windows::PawnIoReader::try_new(&snap.cpu.name);
+                }
+            }
+            if let Some(ref mut pr) = pawnio_reader {
+                pawnio = true;
+                pr.poll()
+            } else {
+                (None, None, None)
+            }
+        };
+
+        #[cfg(windows)]
         {
             if let Some(ref r) = pdh_thermal {
                 let (t, perf_pct) = r.poll();
-                snap.cpu.temperature_c = t;
+                snap.cpu.temperature_c = pawnio_temp.or(t);
                 if let Some(pct) = perf_pct {
                     if snap.cpu.base_clock_ghz > 0.1 {
                         snap.cpu.current_clock_ghz = snap.cpu.base_clock_ghz * (pct / 100.0);
                     }
                 }
+            } else {
+                snap.cpu.temperature_c = pawnio_temp;
             }
+            snap.pawnio_installed = pawnio;
         }
         #[cfg(target_os = "linux")]
         {
@@ -211,7 +237,7 @@ fn run_worker(
             snap.storage.usage_percent = (((tot_b - avail_b) as f64 / tot_b as f64) * 100.0) as f32;
         }
 
-        if tick == 1 || tick % 5 == 0 {
+        if tick == 1 || tick % 2 == 0 {
             #[cfg(windows)]
             {
                 cached_disks = windows::probe_physical_disks();
@@ -228,13 +254,18 @@ fn run_worker(
             .map(|d| d.interface_label.clone())
             .unwrap_or_else(|| "SSD".to_string());
 
-        // 5. Power / Wattage (CPU W + GPU W + Device Total W)
+        // 5. Power / Wattage (PawnIO RAPL/PSys + EMI + GPU W + Device Total W)
         #[cfg(windows)]
         {
             snap.power = windows::poll_power_info(
                 &mut emi,
+                pawnio_pkg_w,
+                pawnio_psys_w,
                 snap.gpu.power_watts,
                 snap.gpu.power_limit_watts,
+                snap.cpu.usage_percent,
+                snap.cpu.current_clock_ghz,
+                snap.cpu.base_clock_ghz,
             );
             snap.cpu.package_watts = snap.power.cpu_watts;
         }
@@ -312,13 +343,22 @@ fn run_worker(
                 total_read += (du.read_bytes as f32) / (elapsed * 1024.0 * 1024.0);
                 total_write += (du.written_bytes as f32) / (elapsed * 1024.0 * 1024.0);
 
+                let mut exe_path = proc_
+                    .exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                #[cfg(windows)]
+                if exe_path.is_empty() {
+                    if let Some(wp) = windows::query_process_exe_path(pid_u) {
+                        exe_path = wp;
+                    }
+                }
+
                 raw.push(ProcessItem {
                     pid: pid_u,
+                    pids: vec![pid_u],
                     name: proc_.name().to_string_lossy().to_string(),
-                    exe_path: proc_
-                        .exe()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default(),
+                    exe_path,
                     instance_count: 1,
                     cpu_percent: (proc_.cpu_usage() / ncpu).clamp(0.0, 100.0),
                     ram_mb: proc_.memory() as f32 / (1024.0 * 1024.0),
@@ -336,6 +376,7 @@ fn run_worker(
                         .entry(key)
                         .and_modify(|e| {
                             e.instance_count += 1;
+                            e.pids.push(item.pid);
                             e.cpu_percent = (e.cpu_percent + item.cpu_percent).min(100.0);
                             e.ram_mb += item.ram_mb;
                             e.disk_mbps += item.disk_mbps;
@@ -385,14 +426,28 @@ fn run_worker(
     }
 }
 
-pub fn kill_process_by_pid(pid: u32) -> bool {
-    let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]), true);
-    if let Some(p) = sys.process(sysinfo::Pid::from_u32(pid)) {
-        p.kill()
-    } else {
-        false
+pub fn kill_processes_by_pids(pids: &[u32]) -> bool {
+    if pids.is_empty() {
+        return false;
     }
+    #[cfg(windows)]
+    {
+        if windows::terminate_processes_win32(pids) {
+            return true;
+        }
+    }
+    let mut sys = System::new();
+    let spids: Vec<sysinfo::Pid> = pids.iter().map(|&p| sysinfo::Pid::from_u32(p)).collect();
+    sys.refresh_processes(ProcessesToUpdate::Some(&spids), true);
+    let mut any = false;
+    for sp in spids {
+        if let Some(p) = sys.process(sp) {
+            if p.kill() {
+                any = true;
+            }
+        }
+    }
+    any
 }
 
 #[cfg(test)]
@@ -427,7 +482,16 @@ mod tests {
             }
             let mut emi = windows::EmiPowerReader::new();
             std::thread::sleep(Duration::from_millis(300));
-            let pwr = windows::poll_power_info(&mut emi, gpu.power_watts, gpu.power_limit_watts);
+            let pwr = windows::poll_power_info(
+                &mut emi,
+                None,
+                None,
+                gpu.power_watts,
+                gpu.power_limit_watts,
+                cpu_pct,
+                freq_mhz as f32 / 1000.0,
+                freq_mhz as f32 / 1000.0,
+            );
             let pdh = windows::PdhThermalReader::try_new();
             std::thread::sleep(Duration::from_millis(250));
             let (cpu_t, perf_pct) = pdh.as_ref().map(|r| r.poll()).unwrap_or((None, None));
