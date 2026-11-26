@@ -337,6 +337,37 @@ fn apply_win32_window_icon(window_title: &str) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn apply_win32_z_order(window_title: &str, topmost: bool, desktop_pinned: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetWindowPos, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE,
+    };
+    let title_w: Vec<u16> = window_title.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title_w.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        let z_after = if desktop_pinned {
+            HWND_BOTTOM
+        } else if topmost {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            z_after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
 impl PulseGlassApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = load_settings();
@@ -629,36 +660,57 @@ impl PulseGlassApp {
                 ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(520.0, 32.0)));
+                #[cfg(windows)]
+                apply_win32_z_order("PulseGlass Hardware Monitor", true, false);
             }
             ViewMode::CompactWidget => {
                 ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
-                let lvl = if self.settings.topmost {
+                let lvl = if self.settings.desktop_pinned {
+                    egui::WindowLevel::AlwaysOnBottom
+                } else if self.settings.topmost {
                     egui::WindowLevel::AlwaysOnTop
                 } else {
                     egui::WindowLevel::Normal
                 };
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(lvl));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(480.0, 294.0)));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(520.0, 294.0)));
                 if let (Some(x), Some(y)) = (self.settings.pos_x, self.settings.pos_y) {
                     if x > -5000.0 && y > -5000.0 {
                         ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
                     }
                 }
+                #[cfg(windows)]
+                apply_win32_z_order(
+                    "PulseGlass Hardware Monitor",
+                    self.settings.topmost,
+                    self.settings.desktop_pinned,
+                );
             }
             ViewMode::DetailedWidget => {
                 ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
-                let lvl = if self.settings.topmost {
+                let lvl = if self.settings.desktop_pinned {
+                    egui::WindowLevel::AlwaysOnBottom
+                } else if self.settings.topmost {
                     egui::WindowLevel::AlwaysOnTop
                 } else {
                     egui::WindowLevel::Normal
                 };
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(lvl));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(660.0, 580.0)));
+                #[cfg(windows)]
+                apply_win32_z_order(
+                    "PulseGlass Hardware Monitor",
+                    self.settings.topmost,
+                    self.settings.desktop_pinned,
+                );
             }
             ViewMode::FullWindow => {
+                self.settings.desktop_pinned = false;
                 ctx.send_viewport_cmd(ViewportCommand::Resizable(true));
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(900.0, 640.0)));
+                #[cfg(windows)]
+                apply_win32_z_order("PulseGlass Hardware Monitor", false, false);
             }
         }
         self.clamp_pending_frames = 6;
@@ -769,11 +821,11 @@ fn header_btn(ui: &mut egui::Ui, text: &str, active: bool, primary: Color32, sec
         Stroke::new(0.8_f32, Color32::from_rgb(62, 50, 66))
     };
     ui.add(
-        egui::Button::new(RichText::new(text).size(10.5).color(txt_col))
+        egui::Button::new(RichText::new(text).size(10.0).color(txt_col))
             .fill(fill)
             .stroke(stroke)
             .rounding(Rounding::same(7.0))
-            .min_size(Vec2::new(22.0, 22.0)),
+            .min_size(Vec2::new(20.0, 22.0)),
     )
 }
 
@@ -896,13 +948,16 @@ impl eframe::App for PulseGlassApp {
                     ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
                 }
             } else if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
-                let x = (m.x - 480.0 - 16.0).max(16.0);
+                let x = (m.x - 520.0 - 16.0).max(16.0);
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, 16.0)));
                 self.settings.pos_x = Some(x);
                 self.settings.pos_y = Some(16.0);
             }
             if (self.settings.ui_scale - 1.0).abs() > 0.01 {
                 ctx.set_zoom_factor(self.settings.ui_scale.clamp(0.85, 1.35));
+            }
+            if self.settings.desktop_pinned || !self.settings.topmost {
+                self.apply_window_geometry(ctx);
             }
             self.clamp_pending_frames = 6;
         }
@@ -1201,11 +1256,40 @@ impl eframe::App for PulseGlassApp {
                                 self.toggle_summary(ctx);
                             }
 
-                            let r = header_btn(ui, tr.t("Üstte", "Pin"), self.settings.topmost, primary, secondary)
-                                .on_hover_text(tr.t("Her zaman üstte", "Always on top"));
+                            let r = header_btn(
+                                ui,
+                                tr.t("Masaüstü", "Desk"),
+                                self.settings.desktop_pinned,
+                                primary,
+                                secondary,
+                            )
+                            .on_hover_text(tr.t("Masaüstüne sabitle", "Pin to desktop"));
                             btn_hovered |= r.hovered();
                             if r.clicked() {
+                                self.settings.desktop_pinned = !self.settings.desktop_pinned;
+                                if self.settings.desktop_pinned {
+                                    self.settings.topmost = false;
+                                    if self.mode == ViewMode::FullWindow {
+                                        self.mode = ViewMode::CompactWidget;
+                                    }
+                                }
+                                save_settings(&self.settings);
+                                self.apply_window_geometry(ctx);
+                            }
+
+                            let r = header_btn(
+                                ui,
+                                tr.t("Üstte", "Pin"),
+                                self.settings.topmost && !self.settings.desktop_pinned,
+                                primary,
+                                secondary,
+                            )
+                            .on_hover_text(tr.t("Her zaman üstte", "Always on top"));
+                            btn_hovered |= r.hovered();
+                            if r.clicked() {
+                                self.settings.desktop_pinned = false;
                                 self.settings.topmost = !self.settings.topmost;
+                                save_settings(&self.settings);
                                 self.apply_window_geometry(ctx);
                             }
 
