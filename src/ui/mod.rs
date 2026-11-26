@@ -11,7 +11,10 @@ use crate::installer::{
 use crate::models::{HardwareSnapshot, UpdateCheckResult};
 use crate::settings::{is_portable_mode, load_settings, parse_hex_color, save_settings, AppSettings};
 use crate::telemetry::{kill_process_by_pid, TelemetryHandle};
-use crate::updater::{check_all_updates, download_and_apply_app_update, install_windows_updates};
+use crate::updater::{
+    check_app_update_only, download_and_apply_app_update, install_windows_updates,
+    populate_os_updates,
+};
 use gauges::{draw_circular_gauge, draw_shadowed_osd_text, glass_card};
 use i18n::I18n;
 
@@ -678,7 +681,15 @@ impl PulseGlassApp {
         std::thread::Builder::new()
             .name("pulseglass-updater".to_string())
             .spawn(move || {
-                let r = check_all_updates(en);
+                // Phase 1: Fast GitHub Release check (<1s) — show PulseGlass status right away
+                let mut r = check_app_update_only(en);
+                if let Ok(mut g) = res_arc.write() {
+                    *g = Some(r.clone());
+                }
+                ctx_bg.request_repaint();
+
+                // Phase 2: Windows/OS updates scan (can take 5-15s)
+                populate_os_updates(&mut r, en);
                 if let Ok(mut g) = res_arc.write() {
                     *g = Some(r);
                 }
