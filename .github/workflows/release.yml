@@ -1,4 +1,4 @@
-name: Build & Release (Windows + Linux)
+name: Build & Release (Windows + Linux Multi-Format)
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -31,17 +32,134 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux GUI/OpenGL dev dependencies
+      - name: Install Linux GUI/OpenGL & packaging dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgl1-mesa-dev libgtk-3-dev
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgl1-mesa-dev libgtk-3-dev rpm file fuse libfuse2
       - name: Build PulseGlass (Linux x86_64)
         run: cargo build --release --bin PulseGlass
       - name: Run unit tests
         run: cargo test --bin PulseGlass
-      - name: Stage Linux binary
-        run: cp target/release/PulseGlass target/release/pulseglass-linux-x86_64
+      - name: Package Linux Formats (.deb, .rpm, .tar.gz, .AppImage, portable)
+        run: |
+          set -euo pipefail
+          VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          mkdir -p dist
+
+          # 1. Universal Portable Binary
+          cp target/release/PulseGlass dist/pulseglass-linux-x86_64
+          chmod +x dist/pulseglass-linux-x86_64
+
+          # 2. Debian / Ubuntu (.deb)
+          DEB_DIR="pkg_deb/pulseglass_${VER}_amd64"
+          mkdir -p "$DEB_DIR/DEBIAN" "$DEB_DIR/usr/bin" "$DEB_DIR/usr/share/applications" "$DEB_DIR/usr/share/icons/hicolor/256x256/apps"
+          cp target/release/PulseGlass "$DEB_DIR/usr/bin/pulseglass"
+          chmod 755 "$DEB_DIR/usr/bin/pulseglass"
+          cp Assets/app.png "$DEB_DIR/usr/share/icons/hicolor/256x256/apps/pulseglass.png"
+          cat > "$DEB_DIR/usr/share/applications/pulseglass.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=PulseGlass Hardware Monitor
+          Comment=Lightweight glassmorphic hardware monitor & OSD overlay
+          Exec=/usr/bin/pulseglass
+          Icon=pulseglass
+          Categories=System;Monitor;Utility;
+          Terminal=false
+          EOF
+          cat > "$DEB_DIR/DEBIAN/control" <<EOF
+          Package: pulseglass
+          Version: ${VER}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libc6, libgl1, libxkbcommon0
+          Maintainer: yafermys <https://github.com/yafermys/PulseGlass>
+          Description: Lightweight glassmorphic hardware monitor, OSD strip & system utility
+          EOF
+          dpkg-deb --build --root-owner-group "$DEB_DIR" "dist/pulseglass_${VER}_amd64.deb"
+
+          # 3. Fedora / RHEL / openSUSE (.rpm)
+          RPM_TOP="$PWD/rpmbuild"
+          mkdir -p "$RPM_TOP"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cat > "$RPM_TOP/SPECS/pulseglass.spec" <<EOF
+          Name:           pulseglass
+          Version:        ${VER}
+          Release:        1%{?dist}
+          Summary:        Lightweight glassmorphic hardware monitor & OSD overlay
+          License:        MIT
+          URL:            https://github.com/yafermys/PulseGlass
+          %global debug_package %{nil}
+
+          %description
+          PulseGlass is an ultra-lightweight Rust hardware monitor, pure OSD summary strip, and themeable desktop utility.
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          mkdir -p %{buildroot}/usr/share/applications
+          mkdir -p %{buildroot}/usr/share/icons/hicolor/256x256/apps
+          install -m 0755 $PWD/target/release/PulseGlass %{buildroot}/usr/bin/pulseglass
+          install -m 0644 $PWD/Assets/app.png %{buildroot}/usr/share/icons/hicolor/256x256/apps/pulseglass.png
+          cat > %{buildroot}/usr/share/applications/pulseglass.desktop <<'DESK'
+          [Desktop Entry]
+          Type=Application
+          Name=PulseGlass Hardware Monitor
+          Comment=Lightweight glassmorphic hardware monitor & OSD overlay
+          Exec=/usr/bin/pulseglass
+          Icon=pulseglass
+          Categories=System;Monitor;Utility;
+          Terminal=false
+          DESK
+
+          %files
+          /usr/bin/pulseglass
+          /usr/share/applications/pulseglass.desktop
+          /usr/share/icons/hicolor/256x256/apps/pulseglass.png
+          EOF
+          rpmbuild --define "_topdir $RPM_TOP" -bb "$RPM_TOP/SPECS/pulseglass.spec"
+          cp "$RPM_TOP"/RPMS/x86_64/pulseglass-*.rpm "dist/pulseglass-${VER}-1.x86_64.rpm"
+
+          # 4. Universal Tarball (.tar.gz — Arch / Manjaro / Gentoo / Any Distro)
+          TAR_DIR="pulseglass-${VER}-linux-x86_64"
+          mkdir -p "$TAR_DIR"
+          cp target/release/PulseGlass "$TAR_DIR/pulseglass"
+          chmod +x "$TAR_DIR/pulseglass"
+          cp Assets/app.png "$TAR_DIR/pulseglass.png"
+          cat > "$TAR_DIR/install.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          "$DIR/pulseglass" --install
+          EOF
+          chmod +x "$TAR_DIR/install.sh"
+          tar -czf "dist/pulseglass-${VER}-linux-x86_64.tar.gz" "$TAR_DIR"
+
+          # 5. Universal AppImage (.AppImage)
+          APPDIR="PulseGlass.AppDir"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp target/release/PulseGlass "$APPDIR/usr/bin/pulseglass"
+          chmod +x "$APPDIR/usr/bin/pulseglass"
+          cp Assets/app.png "$APPDIR/pulseglass.png"
+          cp Assets/app.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/pulseglass.png"
+          cat > "$APPDIR/pulseglass.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=PulseGlass
+          Exec=pulseglass
+          Icon=pulseglass
+          Categories=System;Monitor;
+          Terminal=false
+          EOF
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/usr/bin/env bash
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/pulseglass" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+          curl -fsSL -o appimagetool.AppImage https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool.AppImage
+          ARCH=x86_64 ./appimagetool.AppImage --appimage-extract-and-run "$APPDIR" "dist/PulseGlass-${VER}-x86_64.AppImage"
+          ls -lh dist/
       - uses: actions/upload-artifact@v4
         with:
-          name: pulseglass-linux-x86_64
-          path: target/release/pulseglass-linux-x86_64
+          name: pulseglass-linux-packages
+          path: dist/*
