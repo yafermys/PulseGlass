@@ -91,7 +91,11 @@ fn run_worker(
     let is_admin = false;
 
     #[cfg(windows)]
-    let nvml = windows::NvmlReader::try_new();
+    let mut nvml = windows::NvmlReader::try_new();
+    #[cfg(windows)]
+    let mut pdh_gpu = windows::PdhGpuReader::try_new();
+    #[cfg(windows)]
+    let mut pending_pdh_gpu: Option<windows::PdhGpuReader> = None;
     #[cfg(windows)]
     let (reg_dgpu, reg_igpu) = windows::discover_gpus_from_registry();
     #[cfg(windows)]
@@ -207,16 +211,82 @@ fn run_worker(
             0.0
         };
 
-        // 3. GPU + iGPU
+        // 3. GPU + iGPU (Universal DXGI + PDH GPU Engine/Memory + Auto-retrying NVIDIA NVML)
         #[cfg(windows)]
         {
             if let Some(ref ig) = reg_igpu {
                 snap.igpu = ig.clone();
             }
-            if let Some(ref reader) = nvml {
-                reader.poll(&mut snap.gpu);
-            } else if let Some(ref dg) = reg_dgpu {
+            if let Some(ref dg) = reg_dgpu {
                 snap.gpu = dg.clone();
+            }
+
+            // Double-buffered PDH wildcard refresh every 15 ticks so newly launched games/apps
+            // are always captured by \GPU Engine(*) with ZERO 0%-flicker between samples.
+            if let Some(fresh) = pending_pdh_gpu.take() {
+                pdh_gpu = Some(fresh);
+            } else if tick % 15 == 0 {
+                pending_pdh_gpu = windows::PdhGpuReader::try_new();
+            }
+
+            // Populate exact DXGI adapter info + live PDH GPU utilization & VRAM for BOTH dGPU and iGPU!
+            let (pdh_d_util, pdh_d_mem, pdh_i_util, pdh_i_mem) = if let Some(ref pg) = pdh_gpu {
+                if let Some(ref da) = pg.dgpu_adapter {
+                    if snap.gpu.name.is_empty() {
+                        snap.gpu.name = da.name.clone();
+                    }
+                    snap.gpu.is_available = true;
+                    snap.gpu.is_integrated = false;
+                    if da.total_vram_gb > 0.1 {
+                        snap.gpu.total_vram_gb = da.total_vram_gb;
+                    }
+                }
+                if let Some(ref ia) = pg.igpu_adapter {
+                    if snap.igpu.name.is_empty() {
+                        snap.igpu.name = ia.name.clone();
+                    }
+                    snap.igpu.is_available = true;
+                    snap.igpu.is_integrated = true;
+                    if ia.total_vram_gb < 0.5 && ia.shared_vram_gb > 0.5 {
+                        // Integrated GPU uses Shared System Memory (matches Windows Task Manager)
+                        snap.igpu.total_vram_gb = ia.shared_vram_gb;
+                    } else if snap.igpu.total_vram_gb < 0.1 {
+                        snap.igpu.total_vram_gb = ia.total_vram_gb.max(ia.shared_vram_gb);
+                    }
+                }
+                pg.poll()
+            } else {
+                (None, None, None, None)
+            };
+
+            if let Some(iu) = pdh_i_util {
+                snap.igpu.usage_percent = iu;
+            }
+            if let Some(im) = pdh_i_mem {
+                snap.igpu.used_vram_gb = im;
+            }
+
+            // Retry NVML initialization periodically if dGPU woke up from Optimus sleep
+            if nvml.is_none() && tick % 10 == 0 {
+                nvml = windows::NvmlReader::try_new();
+            }
+            let mut nvml_ok = false;
+            if let Some(ref reader) = nvml {
+                nvml_ok = reader.poll(&mut snap.gpu);
+            }
+            if !nvml_ok && nvml.is_some() && tick % 10 == 0 {
+                // Re-acquire NVML handle if GPU lost/slept
+                nvml = windows::NvmlReader::try_new();
+            }
+
+            // Combine PDH dGPU usage & VRAM seamlessly (works for AMD/Intel dGPUs and NVIDIA Optimus!)
+            if let Some(du) = pdh_d_util {
+                snap.gpu.usage_percent = snap.gpu.usage_percent.max(du);
+            }
+            if let Some(dm) = pdh_d_mem {
+                if snap.gpu.used_vram_gb < 0.01 && dm > 0.01 {
+                    snap.gpu.used_vram_gb = dm;
+                }
             }
         }
         #[cfg(target_os = "linux")]
@@ -478,8 +548,12 @@ mod tests {
             let nvml = windows::NvmlReader::try_new();
             let mut gpu = crate::models::GpuInfo::default();
             if let Some(ref r) = nvml {
-                r.poll(&mut gpu);
+                let _ = r.poll(&mut gpu);
             }
+            let pdh_gpu = windows::PdhGpuReader::try_new();
+            std::thread::sleep(Duration::from_millis(250));
+            let pdh_gpu_vals = pdh_gpu.as_ref().map(|p| p.poll());
+            eprintln!("PDH_GPU_CHECK: {:?}", pdh_gpu_vals);
             let mut emi = windows::EmiPowerReader::new();
             std::thread::sleep(Duration::from_millis(300));
             let pwr = windows::poll_power_info(

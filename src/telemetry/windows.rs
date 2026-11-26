@@ -400,8 +400,8 @@ impl NvmlReader {
         let get_clock = load_sym!("nvmlDeviceGetClockInfo", FnNvmlDeviceGetClock);
         let get_fan = load_sym!("nvmlDeviceGetFanSpeed", FnNvmlDeviceGetFan);
         let get_power = load_sym!("nvmlDeviceGetPowerUsage", FnNvmlDeviceGetPower);
-        let get_power_limit =
-            load_sym!("nvmlDeviceGetEnforcedPowerLimit", FnNvmlDeviceGetPowerLimit);
+        let get_power_limit = load_sym!("nvmlDeviceGetEnforcedPowerLimit", FnNvmlDeviceGetPowerLimit)
+            .or_else(|| load_sym!("nvmlDeviceGetPowerManagementLimit", FnNvmlDeviceGetPowerLimit));
         let get_driver = load_sym!("nvmlSystemGetDriverVersion", FnNvmlSystemGetDriver);
 
         if unsafe { init() } != 0 {
@@ -448,22 +448,26 @@ impl NvmlReader {
         })
     }
 
-    pub fn poll(&self, gpu: &mut GpuInfo) {
+    /// Polls live NVIDIA GPU metrics via NVML. Returns `true` if at least one metric succeeded.
+    pub fn poll(&self, gpu: &mut GpuInfo) -> bool {
         gpu.name = self.name.clone();
         gpu.driver_version = self.driver.clone();
         gpu.is_available = true;
         gpu.is_integrated = false;
 
+        let mut any_ok = false;
         if let Some(f) = self.get_util {
             let mut u = NvmlUtilization { gpu: 0, memory: 0 };
             if unsafe { f(self.device, &mut u) } == 0 {
                 gpu.usage_percent = u.gpu as f32;
+                any_ok = true;
             }
         }
         if let Some(f) = self.get_temp {
             let mut t = 0u32;
             if unsafe { f(self.device, 0, &mut t) } == 0 {
                 gpu.temperature_c = Some(t as f32);
+                any_ok = true;
             }
         }
         if let Some(f) = self.get_mem {
@@ -475,12 +479,14 @@ impl NvmlReader {
             if unsafe { f(self.device, &mut m) } == 0 {
                 gpu.total_vram_gb = (m.total as f64 / (1024.0 * 1024.0 * 1024.0)) as f32;
                 gpu.used_vram_gb = (m.used as f64 / (1024.0 * 1024.0 * 1024.0)) as f32;
+                any_ok = true;
             }
         }
         if let Some(f) = self.get_clock {
             let mut clk = 0u32;
             if unsafe { f(self.device, 0, &mut clk) } == 0 {
                 gpu.clock_mhz = Some(clk);
+                any_ok = true;
             }
         }
         if let Some(f) = self.get_fan {
@@ -493,6 +499,7 @@ impl NvmlReader {
             let mut mw = 0u32;
             if unsafe { f(self.device, &mut mw) } == 0 && mw > 0 {
                 gpu.power_watts = Some((mw as f32) / 1000.0);
+                any_ok = true;
             }
         }
         if let Some(f) = self.get_power_limit {
@@ -501,6 +508,347 @@ impl NvmlReader {
                 gpu.power_limit_watts = Some((mw as f32) / 1000.0);
             }
         }
+        any_ok
+    }
+}
+
+// ============================================================================
+// 2B. UNIVERSAL WINDOWS DXGI + PDH GPU MONITOR (ALL GPUs: NVIDIA, AMD, Intel iGPU!)
+// ============================================================================
+
+#[repr(C)]
+struct DxgiAdapterDesc1 {
+    description: [u16; 128],
+    vendor_id: u32,
+    device_id: u32,
+    sub_sys_id: u32,
+    revision: u32,
+    dedicated_video_memory: usize,
+    dedicated_system_memory: usize,
+    shared_system_memory: usize,
+    luid_low: u32,
+    luid_high: i32,
+    flags: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct DxgiAdapterEntry {
+    pub name: String,
+    pub luid_tag: String,
+    pub is_integrated: bool,
+    pub total_vram_gb: f32,
+    pub shared_vram_gb: f32,
+}
+
+/// Enumerates real hardware GPUs via `dxgi.dll` (`CreateDXGIFactory1` -> `EnumAdapters1`)
+/// to map exact Windows Adapter LUIDs (`luid_0xHHHHHHHH_0xLLLLLLLL`) to dGPU & iGPU.
+pub fn enumerate_dxgi_adapters() -> Vec<DxgiAdapterEntry> {
+    type FnCreateFactory1 = unsafe extern "system" fn(*const GUID, *mut *mut c_void) -> i32;
+    type FnEnumAdapters1 = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type FnGetDesc1 = unsafe extern "system" fn(*mut c_void, *mut DxgiAdapterDesc1) -> i32;
+    type FnRelease = unsafe extern "system" fn(*mut c_void) -> u32;
+
+    const IID_IDXGIFACTORY1: GUID = GUID {
+        data1: 0x770A_AE78,
+        data2: 0xF26F,
+        data3: 0x4DBA,
+        data4: [0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87],
+    };
+
+    let mut out = Vec::new();
+    let w = to_wide("dxgi.dll");
+    unsafe {
+        let m = LoadLibraryW(w.as_ptr());
+        if m.is_null() {
+            return out;
+        }
+        let Some(p_create) = GetProcAddress(m, b"CreateDXGIFactory1\0".as_ptr()) else {
+            return out;
+        };
+        let create_factory: FnCreateFactory1 = std::mem::transmute(p_create);
+        let mut factory: *mut c_void = std::ptr::null_mut();
+        if create_factory(&IID_IDXGIFACTORY1, &mut factory) != 0 || factory.is_null() {
+            return out;
+        }
+
+        let fvtable = *(factory as *const *const usize);
+        let enum_adapters1: FnEnumAdapters1 = std::mem::transmute(*fvtable.add(12));
+        let release_factory: FnRelease = std::mem::transmute(*fvtable.add(2));
+
+        let mut idx = 0u32;
+        loop {
+            let mut adapter: *mut c_void = std::ptr::null_mut();
+            if enum_adapters1(factory, idx, &mut adapter) != 0 || adapter.is_null() {
+                break;
+            }
+            idx += 1;
+
+            let avtable = *(adapter as *const *const usize);
+            let get_desc1: FnGetDesc1 = std::mem::transmute(*avtable.add(10));
+            let release_adapter: FnRelease = std::mem::transmute(*avtable.add(2));
+
+            let mut desc: DxgiAdapterDesc1 = std::mem::zeroed();
+            if get_desc1(adapter, &mut desc) == 0 {
+                // Skip software adapters (DXGI_ADAPTER_FLAG_SOFTWARE = 2)
+                if (desc.flags & 2) == 0 {
+                    let end = desc
+                        .description
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.description.len());
+                    let name = String::from_utf16_lossy(&desc.description[..end])
+                        .trim()
+                        .to_string();
+                    let nl = name.to_ascii_lowercase();
+                    let ded_gb = (desc.dedicated_video_memory as f64) / (1024.0 * 1024.0 * 1024.0);
+                    let shr_gb = (desc.shared_system_memory as f64) / (1024.0 * 1024.0 * 1024.0);
+                    let is_integrated = (desc.vendor_id == 0x8086 && !nl.contains("arc"))
+                        || nl.contains("uhd")
+                        || nl.contains("iris")
+                        || nl.contains("hd graphics")
+                        || (nl.contains("radeon(tm) graphics") && ded_gb < 1.5)
+                        || ded_gb < 0.6;
+                    let luid_tag = format!(
+                        "luid_0x{:08x}_0x{:08x}",
+                        desc.luid_high as u32, desc.luid_low
+                    );
+                    out.push(DxgiAdapterEntry {
+                        name,
+                        luid_tag,
+                        is_integrated,
+                        total_vram_gb: ded_gb as f32,
+                        shared_vram_gb: shr_gb as f32,
+                    });
+                }
+            }
+            release_adapter(adapter);
+        }
+        release_factory(factory);
+    }
+    out
+}
+
+#[repr(C)]
+struct PdhFmtCounterValueItemW {
+    sz_name: *mut u16,
+    c_status: u32,
+    _pad: u32,
+    double_value: f64,
+}
+
+type FnPdhGetFormattedCounterArrayW = unsafe extern "system" fn(
+    *mut c_void,
+    u32,
+    *mut u32,
+    *mut u32,
+    *mut PdhFmtCounterValueItemW,
+) -> i32;
+
+/// Native Windows PDH GPU Engine & Adapter Memory reader (works for ALL GPUs: NVIDIA, AMD, Intel iGPU!).
+/// Reads exact Windows Task Manager GPU utilization & VRAM usage with zero subprocesses.
+pub struct PdhGpuReader {
+    query: *mut c_void,
+    engine_counter: *mut c_void,
+    ded_mem_counter: *mut c_void,
+    shr_mem_counter: *mut c_void,
+    collect_fn: FnPdhCollectQueryData,
+    get_array_fn: FnPdhGetFormattedCounterArrayW,
+    close_fn: FnPdhCloseQuery,
+    pub dgpu_adapter: Option<DxgiAdapterEntry>,
+    pub igpu_adapter: Option<DxgiAdapterEntry>,
+}
+
+unsafe impl Send for PdhGpuReader {}
+
+impl Drop for PdhGpuReader {
+    fn drop(&mut self) {
+        if !self.query.is_null() {
+            unsafe { (self.close_fn)(self.query) };
+        }
+    }
+}
+
+impl PdhGpuReader {
+    pub fn try_new() -> Option<Self> {
+        let adapters = enumerate_dxgi_adapters();
+        let dgpu_adapter = adapters.iter().find(|a| !a.is_integrated).cloned();
+        let igpu_adapter = adapters.iter().find(|a| a.is_integrated).cloned();
+
+        let w = to_wide("pdh.dll");
+        unsafe {
+            let m = LoadLibraryW(w.as_ptr());
+            if m.is_null() {
+                return None;
+            }
+            let open_fn: FnPdhOpenQueryW =
+                std::mem::transmute(GetProcAddress(m, b"PdhOpenQueryW\0".as_ptr())?);
+            let add_fn: FnPdhAddEnglishCounterW =
+                std::mem::transmute(GetProcAddress(m, b"PdhAddEnglishCounterW\0".as_ptr())?);
+            let collect_fn: FnPdhCollectQueryData =
+                std::mem::transmute(GetProcAddress(m, b"PdhCollectQueryData\0".as_ptr())?);
+            let get_array_fn: FnPdhGetFormattedCounterArrayW = std::mem::transmute(
+                GetProcAddress(m, b"PdhGetFormattedCounterArrayW\0".as_ptr())?,
+            );
+            let close_fn: FnPdhCloseQuery =
+                std::mem::transmute(GetProcAddress(m, b"PdhCloseQuery\0".as_ptr())?);
+
+            let mut query: *mut c_void = std::ptr::null_mut();
+            if open_fn(std::ptr::null(), 0, &mut query) != 0 || query.is_null() {
+                return None;
+            }
+
+            let mut engine_counter: *mut c_void = std::ptr::null_mut();
+            let mut ded_mem_counter: *mut c_void = std::ptr::null_mut();
+            let mut shr_mem_counter: *mut c_void = std::ptr::null_mut();
+
+            let p_eng = to_wide(r"\GPU Engine(*)\Utilization Percentage");
+            let _ = add_fn(query, p_eng.as_ptr(), 0, &mut engine_counter);
+            let p_ded = to_wide(r"\GPU Adapter Memory(*)\Dedicated Usage");
+            let _ = add_fn(query, p_ded.as_ptr(), 0, &mut ded_mem_counter);
+            let p_shr = to_wide(r"\GPU Adapter Memory(*)\Shared Usage");
+            let _ = add_fn(query, p_shr.as_ptr(), 0, &mut shr_mem_counter);
+
+            if engine_counter.is_null() && ded_mem_counter.is_null() {
+                close_fn(query);
+                return None;
+            }
+            let _ = collect_fn(query);
+            Some(Self {
+                query,
+                engine_counter,
+                ded_mem_counter,
+                shr_mem_counter,
+                collect_fn,
+                get_array_fn,
+                close_fn,
+                dgpu_adapter,
+                igpu_adapter,
+            })
+        }
+    }
+
+    fn read_counter_array(&self, counter: *mut c_void) -> Vec<(String, f64)> {
+        if counter.is_null() {
+            return Vec::new();
+        }
+        const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
+        let mut buf_size = 0u32;
+        let mut count = 0u32;
+        unsafe {
+            let _ = (self.get_array_fn)(
+                counter,
+                PDH_FMT_DOUBLE,
+                &mut buf_size,
+                &mut count,
+                std::ptr::null_mut(),
+            );
+            if buf_size == 0 || count == 0 || buf_size > 8 * 1024 * 1024 {
+                return Vec::new();
+            }
+            let mut raw = vec![0u8; buf_size as usize];
+            let items = raw.as_mut_ptr() as *mut PdhFmtCounterValueItemW;
+            let st = (self.get_array_fn)(counter, PDH_FMT_DOUBLE, &mut buf_size, &mut count, items);
+            if st != 0 {
+                return Vec::new();
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for i in 0..(count as usize) {
+                let it = &*items.add(i);
+                if it.c_status == 0 && !it.sz_name.is_null() && it.double_value.is_finite() {
+                    let mut len = 0usize;
+                    while *it.sz_name.add(len) != 0 && len < 512 {
+                        len += 1;
+                    }
+                    let name = String::from_utf16_lossy(std::slice::from_raw_parts(it.sz_name, len))
+                        .to_ascii_lowercase();
+                    res.push((name, it.double_value));
+                }
+            }
+            res
+        }
+    }
+
+    /// Returns `(dgpu_util_pct, dgpu_used_vram_gb, igpu_util_pct, igpu_used_vram_gb)`
+    pub fn poll(&self) -> (Option<f32>, Option<f32>, Option<f32>, Option<f32>) {
+        if unsafe { (self.collect_fn)(self.query) } != 0 {
+            return (None, None, None, None);
+        }
+
+        let d_tag = self.dgpu_adapter.as_ref().map(|a| a.luid_tag.as_str());
+        let i_tag = self.igpu_adapter.as_ref().map(|a| a.luid_tag.as_str());
+
+        // Sum utilization per (adapter_is_igpu, engine_type) then take max engine (Task Manager formula)
+        let mut d_eng: HashMap<String, f64> = HashMap::new();
+        let mut i_eng: HashMap<String, f64> = HashMap::new();
+        for (name, val) in self.read_counter_array(self.engine_counter) {
+            if val <= 0.0 || val > 100.0 {
+                continue;
+            }
+            let eng_key = name
+                .rsplit("engtype_")
+                .next()
+                .unwrap_or("3d")
+                .to_string();
+            if let Some(dt) = d_tag {
+                if name.contains(dt) {
+                    *d_eng.entry(eng_key).or_insert(0.0) += val;
+                    continue;
+                }
+            }
+            if let Some(it) = i_tag {
+                if name.contains(it) {
+                    *i_eng.entry(eng_key).or_insert(0.0) += val;
+                }
+            }
+        }
+        let d_util = if d_tag.is_some() {
+            Some(
+                d_eng
+                    .values()
+                    .copied()
+                    .fold(0.0f64, f64::max)
+                    .clamp(0.0, 100.0) as f32,
+            )
+        } else {
+            None
+        };
+        let i_util = if i_tag.is_some() {
+            Some(
+                i_eng
+                    .values()
+                    .copied()
+                    .fold(0.0f64, f64::max)
+                    .clamp(0.0, 100.0) as f32,
+            )
+        } else {
+            None
+        };
+
+        let mut d_mem_gb = None;
+        let mut i_mem_gb = None;
+        for (name, val) in self.read_counter_array(self.ded_mem_counter) {
+            let gb = (val / (1024.0 * 1024.0 * 1024.0)) as f32;
+            if let Some(dt) = d_tag {
+                if name.contains(dt) && gb >= 0.0 {
+                    d_mem_gb = Some(gb);
+                }
+            }
+            if let Some(it) = i_tag {
+                if name.contains(it) && gb > 0.01 {
+                    i_mem_gb = Some(gb);
+                }
+            }
+        }
+        // Integrated GPUs mainly allocate from Shared System Memory -> read Shared Usage for iGPU!
+        for (name, val) in self.read_counter_array(self.shr_mem_counter) {
+            let gb = (val / (1024.0 * 1024.0 * 1024.0)) as f32;
+            if let Some(it) = i_tag {
+                if name.contains(it) && gb >= 0.0 {
+                    i_mem_gb = Some(i_mem_gb.unwrap_or(0.0) + gb);
+                }
+            }
+        }
+        (d_util, d_mem_gb, i_util, i_mem_gb)
     }
 }
 

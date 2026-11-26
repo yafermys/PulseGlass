@@ -1678,7 +1678,11 @@ impl PulseGlassApp {
                 ui.add_space(2.0);
                 ui.label(RichText::new(tr.t("Dahili GPU", "Integrated GPU")).strong().size(11.0).color(Color32::from_rgb(255, 232, 224)));
                 let sub = if snap.igpu.is_available {
-                    format!("{:.1} GB", snap.igpu.total_vram_gb.max(snap.igpu.used_vram_gb))
+                    if snap.igpu.used_vram_gb >= 0.05 && snap.igpu.total_vram_gb >= 0.1 {
+                        format!("{:.1} / {:.1} GB", snap.igpu.used_vram_gb, snap.igpu.total_vram_gb)
+                    } else {
+                        format!("{:.1} GB", snap.igpu.total_vram_gb.max(snap.igpu.used_vram_gb))
+                    }
                 } else {
                     tr.t("Yok", "None").to_string()
                 };
@@ -1892,7 +1896,11 @@ impl PulseGlassApp {
                     ui.add_space(4.0);
                     ui.label(RichText::new(tr.t("Dahili GPU (iGPU)", "Integrated GPU")).strong().size(11.0).color(Color32::from_rgb(255, 241, 235)));
                     let sub = if snap.igpu.is_available {
-                        format!("{:.1} GB", snap.igpu.total_vram_gb.max(snap.igpu.used_vram_gb))
+                        if snap.igpu.used_vram_gb >= 0.05 && snap.igpu.total_vram_gb >= 0.1 {
+                            format!("{:.1} / {:.1} GB", snap.igpu.used_vram_gb, snap.igpu.total_vram_gb)
+                        } else {
+                            format!("{:.1} GB", snap.igpu.total_vram_gb.max(snap.igpu.used_vram_gb))
+                        }
                     } else {
                         tr.t("Algılanmadı", "Not Detected").to_string()
                     };
@@ -2094,8 +2102,8 @@ impl PulseGlassApp {
                 if snap.pawnio_installed {
                     ui.label(
                         RichText::new(tr.t(
-                            "✓ PawnIO Donanım Sürücüsü aktif (CPU Watt & Çekirdek Sıcaklığı — WinRing0 yok).",
-                            "✓ PawnIO Hardware Driver active (CPU Watts & Core Temp — zero WinRing0).",
+                            "• PawnIO Donanım Sürücüsü aktif (CPU Watt & Çekirdek Sıcaklığı — WinRing0 yok).",
+                            "• PawnIO Hardware Driver active (CPU Watts & Core Temp — zero WinRing0).",
                         ))
                         .size(10.5)
                         .color(Color32::from_rgb(110, 231, 183)),
@@ -2702,52 +2710,64 @@ impl PulseGlassApp {
 
         ui.add_space(6.0);
 
-        // 2. Expanded Curated Visual Themes (12 Presets with Color Swatches!)
+        // 2. Minimal, Clean Curated Visual Themes (12 Presets — neat 4-column sleek chips, zero overflow)
         glass_card(ui, secondary, |ui| {
             ui.label(
-                RichText::new(tr.t("HAZIR GÖRSEL TEMALAR (12 TEMA)", "CURATED VISUAL THEMES (12 PRESETS)"))
+                RichText::new(tr.t("HAZIR TEMALAR", "THEME PRESETS"))
                     .strong()
                     .size(11.0)
                     .color(secondary),
             );
-            ui.add_space(4.0);
-            egui::Grid::new("theme_presets_grid")
-                .num_columns(3)
-                .spacing([8.0, 6.0])
-                .show(ui, |ui| {
-                    for (i, preset) in THEME_PRESETS.iter().enumerate() {
+            ui.add_space(5.0);
+            for (row_idx, row) in THEME_PRESETS.chunks(4).enumerate() {
+                ui.columns(4, |cols| {
+                    for (col_idx, preset) in row.iter().enumerate() {
+                        let i = row_idx * 4 + col_idx;
                         let p_col = parse_hex_color(preset.primary, primary);
-                        let s_col = parse_hex_color(preset.secondary, secondary);
-                        let b_col = parse_hex_color(preset.bg, Color32::BLACK);
                         let name = if tr.en { preset.name_en } else { preset.name_tr };
                         let active = self.settings.primary_hex.eq_ignore_ascii_case(preset.primary)
                             && self.settings.bg_hex.eq_ignore_ascii_case(preset.bg);
 
+                        let chip_fill = if active {
+                            Color32::from_rgba_unmultiplied(p_col.r(), p_col.g(), p_col.b(), 34)
+                        } else {
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 9)
+                        };
+                        let chip_stroke = if active {
+                            Stroke::new(1.2_f32, p_col)
+                        } else {
+                            Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 26))
+                        };
+
                         let resp = egui::Frame::none()
-                            .fill(b_col)
-                            .stroke(Stroke::new(
-                                if active { 1.8_f32 } else { 1.0_f32 },
-                                if active { p_col } else { s_col },
-                            ))
-                            .rounding(Rounding::same(8.0))
+                            .fill(chip_fill)
+                            .stroke(chip_stroke)
+                            .rounding(Rounding::same(12.0))
                             .inner_margin(egui::Margin::symmetric(8.0, 5.0))
-                            .show(ui, |ui| {
-                                ui.set_min_width(175.0);
+                            .show(&mut cols[col_idx], |ui| {
+                                ui.set_width((ui.available_width()).max(60.0));
                                 ui.horizontal(|ui| {
-                                    let (r1, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                                    ui.painter().circle_filled(r1.center(), 4.5, p_col);
-                                    let (r2, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                                    ui.painter().circle_filled(r2.center(), 4.5, s_col);
-                                    ui.label(
-                                        RichText::new(name)
-                                            .strong()
-                                            .size(10.5)
-                                            .color(Color32::from_rgb(245, 240, 242)),
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let (dot, _) =
+                                        ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(dot.center(), 3.8, p_col);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(name)
+                                                .size(10.5)
+                                                .color(if active {
+                                                    Color32::WHITE
+                                                } else {
+                                                    Color32::from_rgb(218, 214, 224)
+                                                }),
+                                        )
+                                        .truncate(),
                                     );
                                 });
                             })
                             .response;
-                        let click = ui.interact(
+
+                        let click = cols[col_idx].interact(
                             resp.rect,
                             egui::Id::new(("theme_preset", i)),
                             egui::Sense::click(),
@@ -2760,11 +2780,10 @@ impl PulseGlassApp {
                             self.settings.text_hex = preset.text.to_string();
                             self.settings.custom_theme_name = name.to_string();
                         }
-                        if (i + 1) % 3 == 0 {
-                            ui.end_row();
-                        }
                     }
                 });
+                ui.add_space(5.0);
+            }
         });
 
         ui.add_space(6.0);
