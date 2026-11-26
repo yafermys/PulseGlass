@@ -18,7 +18,7 @@ use crate::updater::{
     check_app_update_only, download_and_apply_app_update, install_windows_updates,
     populate_os_updates,
 };
-use gauges::{draw_circular_gauge, draw_shadowed_osd_text, glass_card};
+use gauges::{draw_circular_gauge, draw_shadowed_osd_text, glass_card, measure_osd_text_size};
 use i18n::I18n;
 use media_theme::{
     extract_theme_from_rgba, pick_media_file, BackgroundMediaPlayer, ExtractedPalette,
@@ -134,6 +134,8 @@ pub struct PulseGlassApp {
     ghost_mode: bool,
     positioned_initial: bool,
     last_osd_size: Vec2,
+    osd_layout_key: u64,
+    raise_pending_frames: u8,
 
     telemetry: TelemetryHandle,
     hotkeys: HotkeyManager,
@@ -430,10 +432,16 @@ fn apply_win32_window_icon(window_title: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn apply_win32_z_order(window_title: &str, topmost: bool, desktop_pinned: bool) {
+fn apply_win32_z_order(
+    window_title: &str,
+    topmost: bool,
+    desktop_pinned: bool,
+    bring_front: bool,
+) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, SetWindowPos, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE,
+        BringWindowToTop, FindWindowW, SetForegroundWindow, SetWindowPos, HWND_BOTTOM,
+        HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_SHOWWINDOW,
     };
     let title_w: Vec<u16> = window_title.encode_utf16().chain(Some(0)).collect();
     unsafe {
@@ -441,22 +449,55 @@ fn apply_win32_z_order(window_title: &str, topmost: bool, desktop_pinned: bool) 
         if hwnd.is_null() {
             return;
         }
-        let z_after = if desktop_pinned {
-            HWND_BOTTOM
-        } else if topmost {
-            HWND_TOPMOST
+        if desktop_pinned && !bring_front {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_BOTTOM,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            return;
+        }
+        if topmost {
+            let flags = if bring_front {
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+            } else {
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+            };
+            let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            if bring_front {
+                let _ = BringWindowToTop(hwnd);
+                let _ = SetForegroundWindow(hwnd);
+            }
         } else {
-            HWND_NOTOPMOST
-        };
-        let _ = SetWindowPos(
-            hwnd,
-            z_after,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+            // Leaving AlwaysOnTop with HWND_NOTOPMOST alone can drop the window behind others;
+            // immediately follow with HWND_TOP + BringWindowToTop + SetForegroundWindow!
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            if bring_front {
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                );
+                let _ = BringWindowToTop(hwnd);
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
     }
 }
 
@@ -508,6 +549,8 @@ impl PulseGlassApp {
             ghost_mode: false,
             positioned_initial: false,
             last_osd_size: Vec2::ZERO,
+            osd_layout_key: 0,
+            raise_pending_frames: 0,
             telemetry,
             hotkeys,
             capturing_hotkey: None,
@@ -799,14 +842,21 @@ impl PulseGlassApp {
     }
 
     fn toggle_summary(&mut self, ctx: &egui::Context) {
+        // Never send the app behind other windows when entering or exiting Summary OSD!
+        if self.settings.desktop_pinned {
+            self.settings.desktop_pinned = false;
+        }
         if self.mode == ViewMode::SummaryOsd {
             self.mode = self.prev_non_summary_mode;
         } else {
             self.prev_non_summary_mode = self.mode;
             self.mode = ViewMode::SummaryOsd;
             self.last_osd_size = Vec2::ZERO;
+            self.osd_layout_key = 0;
         }
-        self.apply_window_geometry(ctx);
+        self.apply_window_geometry_with_focus(ctx, true);
+        self.raise_pending_frames = 5;
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
     }
 
     fn toggle_ghost(&mut self, ctx: &egui::Context) {
@@ -815,6 +865,10 @@ impl PulseGlassApp {
     }
 
     fn apply_window_geometry(&mut self, ctx: &egui::Context) {
+        self.apply_window_geometry_with_focus(ctx, false);
+    }
+
+    fn apply_window_geometry_with_focus(&mut self, ctx: &egui::Context, bring_front: bool) {
         // Scale ALL interfaces proportionally with ui_scale EXCEPT Summary OSD (always 1.0 zoom, uses summary_font_size!)
         let s = if self.mode == ViewMode::SummaryOsd {
             1.0
@@ -836,13 +890,17 @@ impl PulseGlassApp {
             ViewMode::SummaryOsd => {
                 ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(520.0, 34.0)));
+                if self.last_osd_size.x > 10.0 && self.last_osd_size.y > 10.0 {
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(self.last_osd_size));
+                } else {
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(520.0, 34.0)));
+                }
                 #[cfg(windows)]
-                apply_win32_z_order("PulseGlass Hardware Monitor", true, false);
+                apply_win32_z_order("PulseGlass Hardware Monitor", true, false, bring_front);
             }
             ViewMode::CompactWidget => {
                 ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
-                let lvl = if self.settings.desktop_pinned {
+                let lvl = if self.settings.desktop_pinned && !bring_front {
                     egui::WindowLevel::AlwaysOnBottom
                 } else if self.settings.topmost {
                     egui::WindowLevel::AlwaysOnTop
@@ -861,11 +919,12 @@ impl PulseGlassApp {
                     "PulseGlass Hardware Monitor",
                     self.settings.topmost,
                     self.settings.desktop_pinned,
+                    bring_front,
                 );
             }
             ViewMode::DetailedWidget => {
                 ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
-                let lvl = if self.settings.desktop_pinned {
+                let lvl = if self.settings.desktop_pinned && !bring_front {
                     egui::WindowLevel::AlwaysOnBottom
                 } else if self.settings.topmost {
                     egui::WindowLevel::AlwaysOnTop
@@ -879,6 +938,7 @@ impl PulseGlassApp {
                     "PulseGlass Hardware Monitor",
                     self.settings.topmost,
                     self.settings.desktop_pinned,
+                    bring_front,
                 );
             }
             ViewMode::FullWindow => {
@@ -887,7 +947,7 @@ impl PulseGlassApp {
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(cap_size(900.0, 640.0)));
                 #[cfg(windows)]
-                apply_win32_z_order("PulseGlass Hardware Monitor", false, false);
+                apply_win32_z_order("PulseGlass Hardware Monitor", false, false, bring_front);
             }
         }
         self.clamp_pending_frames = 6;
@@ -926,6 +986,79 @@ impl PulseGlassApp {
                 ctx_bg.request_repaint();
             })
             .ok();
+    }
+
+    /// Worst-case fixed-width template for Summary OSD so the window NEVER shrinks/grows as values change!
+    fn summary_layout_key(&self, igpu_avail: bool) -> u64 {
+        let mut mask: u64 = 0;
+        let flags = [
+            self.settings.sum_cpu_pct,
+            self.settings.sum_cpu_temp,
+            self.settings.sum_gpu_pct,
+            self.settings.sum_gpu_temp,
+            self.settings.sum_igpu_pct && igpu_avail,
+            self.settings.sum_ram_pct,
+            self.settings.sum_ssd_temp,
+            self.settings.sum_gpu_watts,
+            self.settings.sum_device_watts,
+            self.settings.sum_fps,
+            self.settings.language.eq_ignore_ascii_case("en"),
+        ];
+        for (i, &f) in flags.iter().enumerate() {
+            if f {
+                mask |= 1u64 << i;
+            }
+        }
+        let font_q = (self.settings.summary_font_size.clamp(9.0, 28.0) * 10.0).round() as u64;
+        mask | (font_q << 24)
+    }
+
+    fn build_summary_template_line(&self, igpu_avail: bool, tr: &I18n) -> String {
+        let mut parts = Vec::new();
+        if self.settings.sum_cpu_pct || self.settings.sum_cpu_temp {
+            let mut s = String::from("CPU");
+            if self.settings.sum_cpu_pct {
+                s.push_str(" 100%");
+            }
+            if self.settings.sum_cpu_temp {
+                s.push_str(" (100°C)");
+            }
+            parts.push(s);
+        }
+        if self.settings.sum_gpu_pct || self.settings.sum_gpu_temp {
+            let mut s = String::from("GPU");
+            if self.settings.sum_gpu_pct {
+                s.push_str(" 100%");
+            }
+            if self.settings.sum_gpu_temp {
+                s.push_str(" (100°C)");
+            }
+            parts.push(s);
+        }
+        if self.settings.sum_igpu_pct && igpu_avail {
+            parts.push("iGPU 100%".to_string());
+        }
+        if self.settings.sum_ram_pct {
+            parts.push("RAM 100%".to_string());
+        }
+        if self.settings.sum_ssd_temp {
+            parts.push("SSD 100°C".to_string());
+        }
+        if self.settings.sum_gpu_watts {
+            parts.push("GPU 999.9 W".to_string());
+        }
+        if self.settings.sum_device_watts {
+            parts.push(format!("{} ~999.9 W", tr.t("Cihaz", "Sys")));
+        }
+        if self.settings.sum_fps {
+            parts.push("FPS: 999".to_string());
+        }
+        if parts.is_empty() {
+            tr.t("Özet boş (Ayarlar'dan seçin)", "Summary empty (select in Settings)")
+                .to_string()
+        } else {
+            parts.join("  •  ")
+        }
     }
 
     /// Restores exact original PulseGlass summary format: CPU 28% (52°C) • GPU 0% (41°C) • RAM 78% • SSD 56°C • FPS: --
@@ -1147,6 +1280,19 @@ impl eframe::App for PulseGlassApp {
             self.clamp_current_win32_window(ctx);
         }
 
+        // Re-assert foreground Z-order after Summary OSD enter/exit (runs after winit processes WindowLevel!)
+        #[cfg(windows)]
+        if self.raise_pending_frames > 0 {
+            self.raise_pending_frames -= 1;
+            let want_top = match self.mode {
+                ViewMode::SummaryOsd => true,
+                ViewMode::FullWindow => false,
+                ViewMode::CompactWidget | ViewMode::DetailedWidget => self.settings.topmost,
+            };
+            apply_win32_z_order("PulseGlass Hardware Monitor", want_top, false, true);
+            ctx.request_repaint();
+        }
+
         // Save current position only when on-screen and not minimized (-32000 on Windows)
         if self.mode == ViewMode::CompactWidget || self.mode == ViewMode::SummaryOsd {
             if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
@@ -1314,25 +1460,26 @@ impl eframe::App for PulseGlassApp {
             self.begin_window_drag(ctx);
         }
 
-        // 4. PURE SUMMARY OSD MODE — ONLY selected values, ZERO chrome, ALWAYS transparent, custom font size!
+        // 4. PURE SUMMARY OSD MODE — ONLY selected values, ZERO chrome, ALWAYS transparent, FIXED size (zero jitter!)
         if self.mode == ViewMode::SummaryOsd {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
                 .show(ctx, |ui| {
-                    let line = self.build_summary_line(&snap, &tr);
                     let font_sz = self.settings.summary_font_size.clamp(9.0, 28.0);
-                    let (rect, resp) = draw_shadowed_osd_text(ui, &line, text_col, font_sz);
+                    let key = self.summary_layout_key(snap.igpu.is_available);
+                    if key != self.osd_layout_key || self.last_osd_size.x < 10.0 {
+                        let tmpl = self.build_summary_template_line(snap.igpu.is_available, &tr);
+                        let fixed = measure_osd_text_size(ui, &tmpl, font_sz);
+                        self.osd_layout_key = key;
+                        self.last_osd_size = fixed;
+                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(fixed));
+                        self.clamp_pending_frames = 4;
+                    }
+                    let line = self.build_summary_line(&snap, &tr);
+                    let (_rect, resp) =
+                        draw_shadowed_osd_text(ui, &line, text_col, font_sz, Some(self.last_osd_size));
                     if !self.ghost_mode && (resp.hovered() && primary_pressed) {
                         self.begin_window_drag(ctx);
-                    }
-                    let target = Vec2::new(
-                        (rect.width() + 14.0).max(140.0),
-                        (rect.height() + 8.0).max(24.0),
-                    );
-                    if (target - self.last_osd_size).length() > 3.0 {
-                        self.last_osd_size = target;
-                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
-                        self.clamp_pending_frames = 4;
                     }
                 });
             return;

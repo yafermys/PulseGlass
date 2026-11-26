@@ -56,34 +56,70 @@ fn read_rapl_uj() -> Option<u64> {
 }
 
 pub fn read_cpu_temp() -> Option<f32> {
-    let Ok(entries) = fs::read_dir("/sys/class/hwmon") else {
-        return None;
-    };
     let mut acpi_fallback = None;
-    for entry in entries.flatten() {
-        let p = entry.path();
-        let name = fs::read_to_string(p.join("name"))
-            .unwrap_or_default()
-            .trim()
-            .to_lowercase();
-        if let Ok(raw) = fs::read_to_string(p.join("temp1_input")) {
-            if let Ok(mc) = raw.trim().parse::<f32>() {
-                let c = mc / 1000.0;
-                if c > 10.0 && c < 115.0 {
-                    if name.contains("coretemp")
-                        || name.contains("k10temp")
-                        || name.contains("zenpower")
-                    {
-                        return Some(c.round());
+    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let name = fs::read_to_string(p.join("name"))
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            // AMD Ryzen k10temp/zenpower may expose Tdie on temp2_input and Tctl on temp1_input
+            if name.contains("k10temp") || name.contains("zenpower") {
+                for file in ["temp2_input", "temp1_input", "temp3_input"] {
+                    if let Ok(raw) = fs::read_to_string(p.join(file)) {
+                        if let Ok(mc) = raw.trim().parse::<f32>() {
+                            let c = mc / 1000.0;
+                            if c > 10.0 && c < 115.0 {
+                                return Some(c.round());
+                            }
+                        }
                     }
-                    if name.contains("acpitz") && acpi_fallback.is_none() {
-                        acpi_fallback = Some(c.round());
+                }
+            }
+            if let Ok(raw) = fs::read_to_string(p.join("temp1_input")) {
+                if let Ok(mc) = raw.trim().parse::<f32>() {
+                    let c = mc / 1000.0;
+                    if c > 10.0 && c < 115.0 {
+                        if name.contains("coretemp") || name.contains("x86_pkg_temp") {
+                            return Some(c.round());
+                        }
+                        if (name.contains("acpitz")
+                            || name.contains("thinkpad")
+                            || name.contains("asus")
+                            || name.contains("dell_smm"))
+                            && acpi_fallback.is_none()
+                        {
+                            acpi_fallback = Some(c.round());
+                        }
                     }
                 }
             }
         }
     }
-    acpi_fallback
+    if acpi_fallback.is_some() {
+        return acpi_fallback;
+    }
+    if let Ok(zones) = fs::read_dir("/sys/class/thermal") {
+        for z in zones.flatten() {
+            let zp = z.path();
+            let ztype = fs::read_to_string(zp.join("type"))
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            if ztype.contains("x86_pkg_temp") || ztype.contains("cpu") || ztype.contains("acpi") {
+                if let Ok(raw) = fs::read_to_string(zp.join("temp")) {
+                    if let Ok(mc) = raw.trim().parse::<f32>() {
+                        let c = mc / 1000.0;
+                        if c > 10.0 && c < 115.0 {
+                            return Some(c.round());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn probe_physical_disks() -> Vec<PhysicalDiskInfo> {

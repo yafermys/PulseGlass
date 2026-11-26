@@ -289,6 +289,30 @@ pub fn download_and_apply_app_update(download_url: &str, en: bool) -> Result<Str
     })
 }
 
+fn decode_base64_utf8(input: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn check_os_updates(res: &mut UpdateCheckResult, en: bool) {
     #[cfg(windows)]
     {
@@ -296,6 +320,7 @@ fn check_os_updates(res: &mut UpdateCheckResult, en: bool) {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let ps = r#"
 $ErrorActionPreference='Stop'
+$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $s = New-Object -ComObject Microsoft.Update.Session
 $sr = $s.CreateUpdateSearcher()
 $r = $sr.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
@@ -311,7 +336,8 @@ foreach ($u in $r.Updates) {
         category = $cat
     }
 }
-$out | ConvertTo-Json -Compress
+$json = if ($out.Count -eq 0) { '[]' } else { ($out | ConvertTo-Json -Compress) }
+[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
 "#;
         match Command::new("powershell")
             .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps])
@@ -319,8 +345,9 @@ $out | ConvertTo-Json -Compress
             .output()
         {
             Ok(out) if out.status.success() => {
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if text.is_empty() || text == "null" {
+                let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let text = decode_base64_utf8(&raw).unwrap_or(raw).trim().to_string();
+                if text.is_empty() || text == "null" || text == "[]" {
                     res.os_status_msg = if en {
                         "Windows is up to date.".to_string()
                     } else {
@@ -426,6 +453,7 @@ pub fn install_windows_updates(include_optional: bool, en: bool) -> String {
         let ps = format!(
             r#"
 $ErrorActionPreference='Stop'
+$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $s = New-Object -ComObject Microsoft.Update.Session
 $sr = $s.CreateUpdateSearcher()
 $r = $sr.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
@@ -493,6 +521,15 @@ mod tests {
             select_release_asset_url(&with_exe, true).as_deref(),
             Some("https://example.com/PulseGlass.exe")
         );
+    }
+
+    #[test]
+    fn base64_utf8_preserves_turkish_update_titles() {
+        // UTF-8 Base64 for: "Windows 11 Güvenlik Güncelleştirmesi — İsteğe Bağlı (ÖĞÜŞÇİı)"
+        let original = "Windows 11 Güvenlik Güncelleştirmesi — İsteğe Bağlı (ÖĞÜŞÇİı)";
+        let b64 = "V2luZG93cyAxMSBHw7x2ZW5saWsgR8O8bmNlbGxlxZ90aXJtZXNpIOKAlCDEsHN0ZcSfZSBCYcSfbMSxICjDlsSew5zFnsOHxLDEsSk=";
+        let decoded = decode_base64_utf8(b64).expect("valid utf8");
+        assert_eq!(decoded, original);
     }
 
     #[test]

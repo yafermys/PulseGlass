@@ -100,14 +100,35 @@ pub fn glass_card<R>(
         })
 }
 
-pub fn draw_shadowed_osd_text(ui: &mut Ui, text: &str, color: Color32, font_size: f32) -> (Rect, egui::Response) {
+pub fn measure_osd_text_size(ui: &egui::Ui, template_text: &str, font_size: f32) -> Vec2 {
+    let font = FontId::proportional(font_size);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(template_text.to_string(), font, Color32::WHITE);
+    Vec2::new(
+        (galley.size().x + 26.0).ceil().max(150.0),
+        (galley.size().y + 14.0).ceil().max(26.0),
+    )
+}
+
+pub fn draw_shadowed_osd_text(
+    ui: &mut Ui,
+    text: &str,
+    color: Color32,
+    font_size: f32,
+    fixed_box: Option<Vec2>,
+) -> (Rect, egui::Response) {
     let font = FontId::proportional(font_size);
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_string(), font.clone(), color);
-    let size = galley.size() + Vec2::new(12.0, 8.0);
+    let natural = galley.size() + Vec2::new(12.0, 8.0);
+    let size = match fixed_box {
+        Some(fb) => Vec2::new(fb.x.max(natural.x), fb.y.max(natural.y)),
+        None => natural,
+    };
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
-    let pos = rect.min + Vec2::new(5.0, 3.0);
+    let pos = rect.min + Vec2::new(6.0, ((rect.height() - galley.size().y) * 0.5).max(2.0));
     let painter = ui.painter();
 
     // Crisp multi-offset black outline shadow so transparent OSD is legible on any screen

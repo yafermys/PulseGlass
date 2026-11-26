@@ -542,7 +542,29 @@ pub struct DxgiAdapterEntry {
     pub shared_vram_gb: f32,
 }
 
-/// Enumerates real hardware GPUs via `dxgi.dll` (`CreateDXGIFactory1` -> `EnumAdapters1`)
+fn is_integrated_gpu_name(nl: &str, vendor_id: Option<u32>, ded_gb: f64) -> bool {
+    let intel_igpu = (vendor_id == Some(0x8086) || nl.contains("intel")) && !nl.contains("arc");
+    let amd_apu = nl.contains("radeon(tm) graphics")
+        || nl.contains("radeon graphics")
+        || nl.contains("vega")
+        || nl.contains("610m")
+        || nl.contains("660m")
+        || nl.contains("680m")
+        || nl.contains("740m")
+        || nl.contains("760m")
+        || nl.contains("780m")
+        || nl.contains("860m")
+        || nl.contains("880m")
+        || nl.contains("890m")
+        || nl.contains("8050s")
+        || nl.contains("8060s");
+    intel_igpu
+        || nl.contains("uhd")
+        || nl.contains("iris")
+        || nl.contains("hd graphics")
+        || amd_apu
+        || (ded_gb > 0.0 && ded_gb < 0.6)
+}
 /// to map exact Windows Adapter LUIDs (`luid_0xHHHHHHHH_0xLLLLLLLL`) to dGPU & iGPU.
 pub fn enumerate_dxgi_adapters() -> Vec<DxgiAdapterEntry> {
     type FnCreateFactory1 = unsafe extern "system" fn(*const GUID, *mut *mut c_void) -> i32;
@@ -604,12 +626,7 @@ pub fn enumerate_dxgi_adapters() -> Vec<DxgiAdapterEntry> {
                     let nl = name.to_ascii_lowercase();
                     let ded_gb = (desc.dedicated_video_memory as f64) / (1024.0 * 1024.0 * 1024.0);
                     let shr_gb = (desc.shared_system_memory as f64) / (1024.0 * 1024.0 * 1024.0);
-                    let is_integrated = (desc.vendor_id == 0x8086 && !nl.contains("arc"))
-                        || nl.contains("uhd")
-                        || nl.contains("iris")
-                        || nl.contains("hd graphics")
-                        || (nl.contains("radeon(tm) graphics") && ded_gb < 1.5)
-                        || ded_gb < 0.6;
+                    let is_integrated = is_integrated_gpu_name(&nl, Some(desc.vendor_id), ded_gb);
                     let luid_tag = format!(
                         "luid_0x{:08x}_0x{:08x}",
                         desc.luid_high as u32, desc.luid_low
@@ -1165,11 +1182,7 @@ pub fn discover_gpus_from_registry() -> (Option<GpuInfo>, Option<GpuInfo>) {
         let vram_gb = (vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)) as f32;
 
         let lower = desc.to_lowercase();
-        let is_integrated = (lower.contains("intel") && !lower.contains("arc"))
-            || lower.contains("uhd")
-            || lower.contains("iris")
-            || lower.contains("radeon(tm) graphics")
-            || lower.contains("vega");
+        let is_integrated = is_integrated_gpu_name(&lower, None, vram_gb as f64);
 
         let info = GpuInfo {
             name: desc,
@@ -1477,6 +1490,8 @@ enum CpuVendor {
 pub struct PawnIoReader {
     handle: HANDLE,
     vendor: CpuVendor,
+    cpu_brand: String,
+    amd_tctl_offset_c: f32,
     energy_unit: f64,
     tj_max: f32,
     last_pkg_energy: Option<(u32, Instant)>,
@@ -1541,6 +1556,8 @@ impl PawnIoReader {
         let mut reader = Self {
             handle: h,
             vendor,
+            cpu_brand: cpu_brand.to_string(),
+            amd_tctl_offset_c: amd_tctl_offset(cpu_brand),
             energy_unit: 0.000_061_035_156_25,
             tj_max: 100.0,
             last_pkg_energy: None,
@@ -1602,8 +1619,55 @@ impl PawnIoReader {
         }
     }
 
+    /// Reads AMD SMN register via PawnIO `AMDFamily17` (`ioctl_read_smn`, 1 u64 offset -> 1 u64 val).
+    /// Acquires `Global\Access_PCI` mutex briefly when available to coordinate safely with HWiNFO/LHM.
+    fn read_smn(&self, offset: u32) -> Option<u32> {
+        use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+        let mut in_buf = [0u8; 40];
+        let fn_name = b"ioctl_read_smn";
+        in_buf[..fn_name.len()].copy_from_slice(fn_name);
+        in_buf[32..40].copy_from_slice(&(offset as u64).to_le_bytes());
+
+        let mtx_name = to_wide(r"Global\Access_PCI");
+        let mtx = unsafe { CreateMutexW(std::ptr::null(), 0, mtx_name.as_ptr()) };
+        let locked = if !mtx.is_null() {
+            unsafe { WaitForSingleObject(mtx, 50) == 0 }
+        } else {
+            false
+        };
+
+        let mut out_val = 0u64;
+        let mut ret = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_PIO_EXECUTE_FN,
+                in_buf.as_ptr() as *const c_void,
+                in_buf.len() as u32,
+                &mut out_val as *mut u64 as *mut c_void,
+                8,
+                &mut ret,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if locked {
+            unsafe { ReleaseMutex(mtx) };
+        }
+        if !mtx.is_null() {
+            unsafe { CloseHandle(mtx) };
+        }
+
+        if ok != 0 && ret >= 8 {
+            Some((out_val & 0xFFFF_FFFF) as u32)
+        } else {
+            None
+        }
+    }
+
     /// Returns `(cpu_temp_c, cpu_pkg_watts, platform_psys_watts)`
     pub fn poll(&mut self) -> (Option<f32>, Option<f32>, Option<f32>) {
+        let _ = &self.cpu_brand;
         let now = Instant::now();
         let mut temp_c = None;
         let mut pkg_w = None;
@@ -1654,6 +1718,11 @@ impl PawnIoReader {
                 }
             }
             CpuVendor::Amd => {
+                // AMD Ryzen Zen 1/+/2/3/4/5 (Family 17h-1Ah) Tctl/Tdie via SMN THM_TCON_CUR_TMP (0x00059800)
+                if let Some(raw_smn) = self.read_smn(0x0005_9800) {
+                    temp_c = decode_amd_smn_temp(raw_smn, self.amd_tctl_offset_c);
+                }
+                // AMD RAPL Package Energy (MSR 0xC001_029B, units from 0xC001_0299)
                 if let Some(v) = self.read_msr(0xC001_029B) {
                     let cur = (v & 0xFFFF_FFFF) as u32;
                     if let Some((prev, pt)) = self.last_pkg_energy {
@@ -1670,6 +1739,46 @@ impl PawnIoReader {
             }
         }
         (temp_c, pkg_w, psys_w)
+    }
+}
+
+/// Known AMD Zen 1 / Zen+ / Threadripper Tctl-to-Tdie fixed temperature offsets (matches Linux k10temp & LHM).
+pub fn amd_tctl_offset(cpu_brand: &str) -> f32 {
+    let b = cpu_brand.to_ascii_uppercase();
+    if b.contains("THREADRIPPER")
+        && (b.contains("1900X")
+            || b.contains("1920X")
+            || b.contains("1950X")
+            || b.contains("2920X")
+            || b.contains("2950X")
+            || b.contains("2970WX")
+            || b.contains("2990WX"))
+    {
+        return 27.0;
+    }
+    if b.contains("1600X") || b.contains("1700X") || b.contains("1800X") {
+        return 20.0;
+    }
+    if b.contains("2700X") {
+        return 10.0;
+    }
+    0.0
+}
+
+/// Decodes AMD SMN `THM_TCON_CUR_TMP` (0x00059800) register into °C (Tdie).
+pub fn decode_amd_smn_temp(raw_val: u32, tctl_offset_c: f32) -> Option<f32> {
+    if raw_val == 0 || raw_val == 0xFFFF_FFFF {
+        return None;
+    }
+    let mut temp_c = ((raw_val >> 21) & 0x7FF) as f32 * 0.125;
+    if (raw_val & (1 << 19)) != 0 {
+        temp_c -= 49.0;
+    }
+    temp_c -= tctl_offset_c;
+    if (10.0..=115.0).contains(&temp_c) {
+        Some(temp_c.round())
+    } else {
+        None
     }
 }
 
@@ -1865,9 +1974,11 @@ const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
 pub struct PdhThermalReader {
     query: *mut c_void,
     temp_counter: *mut c_void,
+    temp_is_wildcard: bool,
     perf_counter: *mut c_void,
     collect: Option<FnPdhCollectQueryData>,
     get_val: Option<FnPdhGetFormattedCounterValue>,
+    get_arr: Option<FnPdhGetFormattedCounterArrayW>,
     close: Option<FnPdhCloseQuery>,
 }
 
@@ -1891,6 +2002,7 @@ impl PdhThermalReader {
             load_pdh!("PdhAddEnglishCounterW", FnPdhAddEnglishCounterW)?;
         let collect = load_pdh!("PdhCollectQueryData", FnPdhCollectQueryData);
         let get_val = load_pdh!("PdhGetFormattedCounterValue", FnPdhGetFormattedCounterValue);
+        let get_arr = load_pdh!("PdhGetFormattedCounterArrayW", FnPdhGetFormattedCounterArrayW);
         let close = load_pdh!("PdhCloseQuery", FnPdhCloseQuery);
 
         let mut query: *mut c_void = std::ptr::null_mut();
@@ -1898,25 +2010,37 @@ impl PdhThermalReader {
             return None;
         }
 
-        // 1. ACPI Thermal Zone counter
-        let paths = [
-            r"\Thermal Zone Information(\_TZ.TZ01)\Temperature",
-            r"\Thermal Zone Information(\_TZ.TZ00)\Temperature",
-            r"\Thermal Zone Information(\_TZ.TZ01_0)\Temperature",
-            r"\Thermal Zone Information(\_TZ.THM0)\Temperature",
-            r"\Thermal Zone Information(\_TZ.THRM)\Temperature",
-            r"\Thermal Zone Information(\_TZ.TZ0)\Temperature",
-        ];
+        // 1. Universal ACPI Thermal Zone counter (wildcard works across Intel, AMD Ryzen & ARM64!)
         let mut temp_counter: *mut c_void = std::ptr::null_mut();
-        for p in &paths {
-            let pw = to_wide(p);
-            if unsafe { add(query, pw.as_ptr(), 0, &mut temp_counter) } == 0 && !temp_counter.is_null() {
-                break;
-            }
+        let mut temp_is_wildcard = false;
+        let wc_path = to_wide(r"\Thermal Zone Information(*)\Temperature");
+        if get_arr.is_some()
+            && unsafe { add(query, wc_path.as_ptr(), 0, &mut temp_counter) } == 0
+            && !temp_counter.is_null()
+        {
+            temp_is_wildcard = true;
+        } else {
             temp_counter = std::ptr::null_mut();
+            let paths = [
+                r"\Thermal Zone Information(\_TZ.TZ01)\Temperature",
+                r"\Thermal Zone Information(\_TZ.TZ00)\Temperature",
+                r"\Thermal Zone Information(\_TZ.TZ01_0)\Temperature",
+                r"\Thermal Zone Information(\_TZ.THM0)\Temperature",
+                r"\Thermal Zone Information(\_TZ.THRM)\Temperature",
+                r"\Thermal Zone Information(\_TZ.TZ0)\Temperature",
+            ];
+            for p in &paths {
+                let pw = to_wide(p);
+                if unsafe { add(query, pw.as_ptr(), 0, &mut temp_counter) } == 0
+                    && !temp_counter.is_null()
+                {
+                    break;
+                }
+                temp_counter = std::ptr::null_mut();
+            }
         }
 
-        // 2. Live CPU % Processor Performance (exact Task Manager Turbo GHz multiplier)
+        // 2. Live CPU % Processor Performance (exact Task Manager Turbo / AMD Precision Boost GHz)
         let mut perf_counter: *mut c_void = std::ptr::null_mut();
         let perf_path = to_wide(r"\Processor Information(_Total)\% Processor Performance");
         if unsafe { add(query, perf_path.as_ptr(), 0, &mut perf_counter) } != 0 {
@@ -1935,9 +2059,11 @@ impl PdhThermalReader {
         Some(Self {
             query,
             temp_counter,
+            temp_is_wildcard,
             perf_counter,
             collect,
             get_val,
+            get_arr,
             close,
         })
     }
@@ -1950,20 +2076,52 @@ impl PdhThermalReader {
             return (None, None);
         }
 
-        let mut temp_c = None;
+        let mut temp_c: Option<f32> = None;
         if !self.temp_counter.is_null() {
-            let mut val = PdhFmtCounterValue {
-                c_status: 0,
-                double_value: 0.0,
-            };
-            let mut ctype = 0u32;
-            if unsafe { get_val(self.temp_counter, PDH_FMT_DOUBLE, &mut ctype, &mut val) } == 0
-                && val.c_status == 0
-            {
-                let k = val.double_value as f32;
-                let c = if k > 200.0 { k - 273.15 } else { k };
-                if c > 15.0 && c < 115.0 {
-                    temp_c = Some(c.round());
+            if self.temp_is_wildcard {
+                if let Some(get_arr) = self.get_arr {
+                    let mut buf_size = 0u32;
+                    let mut count = 0u32;
+                    unsafe {
+                        let _ = get_arr(
+                            self.temp_counter,
+                            PDH_FMT_DOUBLE,
+                            &mut buf_size,
+                            &mut count,
+                            std::ptr::null_mut(),
+                        );
+                        if buf_size > 0 && count > 0 && buf_size < 1024 * 1024 {
+                            let mut raw = vec![0u8; buf_size as usize];
+                            let items = raw.as_mut_ptr() as *mut PdhFmtCounterValueItemW;
+                            if get_arr(self.temp_counter, PDH_FMT_DOUBLE, &mut buf_size, &mut count, items) == 0 {
+                                for i in 0..(count as usize) {
+                                    let it = &*items.add(i);
+                                    if it.c_status == 0 && it.double_value.is_finite() {
+                                        let k = it.double_value as f32;
+                                        let c = if k > 200.0 { k - 273.15 } else { k };
+                                        if c > 18.0 && c < 115.0 {
+                                            temp_c = Some(temp_c.map_or(c.round(), |cur| cur.max(c.round())));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                let mut val = PdhFmtCounterValue {
+                    c_status: 0,
+                    double_value: 0.0,
+                };
+                let mut ctype = 0u32;
+                if unsafe { get_val(self.temp_counter, PDH_FMT_DOUBLE, &mut ctype, &mut val) } == 0
+                    && val.c_status == 0
+                {
+                    let k = val.double_value as f32;
+                    let c = if k > 200.0 { k - 273.15 } else { k };
+                    if c > 15.0 && c < 115.0 {
+                        temp_c = Some(c.round());
+                    }
                 }
             }
         }
@@ -1979,7 +2137,7 @@ impl PdhThermalReader {
                 && val.c_status == 0
             {
                 let pct = val.double_value as f32;
-                if pct > 5.0 && pct < 400.0 {
+                if pct > 5.0 && pct < 500.0 {
                     perf_pct = Some(pct);
                 }
             }
@@ -2586,5 +2744,27 @@ mod etw_tests {
         assert_eq!(fg, 0);
         assert!((142..=146).contains(&max_app));
         assert!((59..=61).contains(&dwm));
+    }
+
+    #[test]
+    fn test_amd_ryzen_smn_temp_and_apu_classification() {
+        // Zen 3/4/5 (0 offset, bit 19 = 0): 62.5 C -> raw = 500 -> 500 << 21
+        let reg_62_5 = 500u32 << 21;
+        assert_eq!(decode_amd_smn_temp(reg_62_5, 0.0), Some(63.0));
+
+        // Zen 3/4/5 with bit 19 range flag (-49 C): raw = (55 + 49) * 8 = 832 -> (832 << 21) | (1 << 19)
+        let reg_55_range = (832u32 << 21) | (1u32 << 19);
+        assert_eq!(decode_amd_smn_temp(reg_55_range, 0.0), Some(55.0));
+
+        // Zen 1 Ryzen 7 1800X has +20 C Tctl offset: 82 C Tctl -> 62 C Tdie
+        assert_eq!(amd_tctl_offset("AMD Ryzen 7 1800X Eight-Core Processor"), 20.0);
+        assert_eq!(decode_amd_smn_temp((82 * 8) << 21, 20.0), Some(62.0));
+        assert_eq!(amd_tctl_offset("AMD Ryzen 7 7800X3D 8-Core Processor"), 0.0);
+
+        // AMD Ryzen APUs with 2-4 GB UMA buffer must classify as integrated GPU, NOT discrete!
+        assert!(is_integrated_gpu_name("amd radeon 780m graphics", Some(0x1002), 4.0));
+        assert!(is_integrated_gpu_name("amd radeon(tm) graphics", Some(0x1002), 2.0));
+        assert!(!is_integrated_gpu_name("amd radeon rx 7800 xt", Some(0x1002), 16.0));
+        assert!(!is_integrated_gpu_name("nvidia geforce rtx 4050 laptop gpu", Some(0x10DE), 6.0));
     }
 }
