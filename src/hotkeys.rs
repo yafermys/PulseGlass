@@ -541,36 +541,38 @@ impl HotkeyManager {
                     let mut cur_sum: Option<HotKey> = None;
                     let mut cur_gh: Option<HotKey> = None;
 
-                    let mut apply_bindings = |sh: &Arc<Mutex<SharedBindings>>| {
-                        if let Some(h) = cur_sum.take() {
+                    let apply_bindings = |sh: &Arc<Mutex<SharedBindings>>,
+                                          c_sum: &mut Option<HotKey>,
+                                          c_gh: &mut Option<HotKey>| {
+                        if let Some(h) = c_sum.take() {
                             let _ = manager.unregister(h);
                         }
-                        if let Some(h) = cur_gh.take() {
+                        if let Some(h) = c_gh.take() {
                             let _ = manager.unregister(h);
                         }
                         if let Ok(mut g) = sh.lock() {
                             g.dirty = false;
                             if let Some(h) = make_hk(&g.summary) {
                                 if manager.register(h).is_ok() {
-                                    cur_sum = Some(h);
+                                    *c_sum = Some(h);
                                 }
                             }
                             if let Some(h) = make_hk(&g.ghost) {
                                 if manager.register(h).is_ok() {
-                                    cur_gh = Some(h);
+                                    *c_gh = Some(h);
                                 }
                             }
                         }
                     };
 
-                    apply_bindings(&shared_bg);
+                    apply_bindings(&shared_bg, &mut cur_sum, &mut cur_gh);
 
                     let rx_ev = GlobalHotKeyEvent::receiver();
                     loop {
                         if let Ok(g) = shared_bg.lock() {
                             if g.dirty {
                                 drop(g);
-                                apply_bindings(&shared_bg);
+                                apply_bindings(&shared_bg, &mut cur_sum, &mut cur_gh);
                             }
                         }
                         if let Ok(ev) = rx_ev.recv_timeout(Duration::from_millis(120)) {
