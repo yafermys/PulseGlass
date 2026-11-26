@@ -2,16 +2,28 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub widget_opacity: f32,
     pub window_opacity: f32,
     pub ui_scale: f32,
+    pub summary_font_size: f32,
     pub refresh_ms: u64,
     pub primary_hex: String,
     pub secondary_hex: String,
     pub bg_hex: String,
+    pub card_hex: String,
+    pub text_hex: String,
+    pub corner_radius: f32,
+    pub border_width: f32,
+    pub custom_theme_name: String,
+    pub bg_sync_modes: bool,
+    pub widget_bg_media: String,
+    pub window_bg_media: String,
+    pub bg_media_dim: f32,
+    pub bg_media_fit: String,
+    pub auto_theme_from_bg: bool,
     pub cpu_temp_thresh: f32,
     pub gpu_temp_thresh: f32,
     pub cpu_use_thresh: f32,
@@ -41,10 +53,22 @@ impl Default for AppSettings {
             widget_opacity: 0.80,
             window_opacity: 0.94,
             ui_scale: 1.0,
+            summary_font_size: 13.5,
             refresh_ms: 1000,
             primary_hex: "#FF4D6D".to_string(),
             secondary_hex: "#FFB085".to_string(),
-            bg_hex: "#120F18".to_string(),
+            bg_hex: "#140E16".to_string(),
+            card_hex: "#221B26".to_string(),
+            text_hex: "#FFF1EB".to_string(),
+            corner_radius: 16.0,
+            border_width: 1.1,
+            custom_theme_name: "Nar Çiçeği".to_string(),
+            bg_sync_modes: true,
+            widget_bg_media: String::new(),
+            window_bg_media: String::new(),
+            bg_media_dim: 0.48,
+            bg_media_fit: "cover".to_string(),
+            auto_theme_from_bg: true,
             cpu_temp_thresh: 85.0,
             gpu_temp_thresh: 85.0,
             cpu_use_thresh: 90.0,
@@ -130,6 +154,10 @@ pub fn parse_hex_color(hex: &str, fallback: egui::Color32) -> egui::Color32 {
     fallback
 }
 
+pub fn color_to_hex(c: egui::Color32) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +166,7 @@ mod tests {
     fn hex_color_parses_correctly() {
         let c = parse_hex_color("#FF4D6D", egui::Color32::WHITE);
         assert_eq!(c, egui::Color32::from_rgb(255, 77, 109));
+        assert_eq!(color_to_hex(c), "#FF4D6D");
     }
 
     #[test]
@@ -148,5 +177,6 @@ mod tests {
         assert_eq!(back.primary_hex, "#FF4D6D");
         assert!(back.sum_fps);
         assert!(back.sum_ssd_temp);
+        assert!((back.summary_font_size - 13.5).abs() < 0.01);
     }
 }
