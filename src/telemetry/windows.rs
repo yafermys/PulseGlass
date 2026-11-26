@@ -84,6 +84,40 @@ fn read_cstring(buf: &[u8], offset: usize) -> String {
     String::from_utf8_lossy(&slice[..end]).trim().to_string()
 }
 
+fn query_storage_temp_prop10(h: HANDLE) -> Option<f32> {
+    // StorageDeviceTemperatureProperty = 10 -> STORAGE_TEMPERATURE_DATA_DESCRIPTOR
+    // Header (16B): Version(4), Size(4), CriticalTemp(2), WarningTemp(2), InfoCount(2), Reserved0(2)
+    // Reserved1(8B), then STORAGE_TEMPERATURE_INFO[0] at offset 24:
+    // Index(2), Temperature(i16 at offset 26, in Celsius), OverThreshold(2), UnderThreshold(2), ...
+    let mut in_buf = [0u8; 12];
+    in_buf[0..4].copy_from_slice(&10u32.to_le_bytes());
+    in_buf[4..8].copy_from_slice(&0u32.to_le_bytes());
+    let mut out_buf = [0u8; 128];
+    let mut ret = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            h,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            in_buf.as_ptr() as *const c_void,
+            in_buf.len() as u32,
+            out_buf.as_mut_ptr() as *mut c_void,
+            out_buf.len() as u32,
+            &mut ret,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 && ret >= 28 {
+        let info_count = u16::from_le_bytes([out_buf[12], out_buf[13]]);
+        if info_count > 0 {
+            let temp_c = i16::from_le_bytes([out_buf[26], out_buf[27]]) as f32;
+            if temp_c > 5.0 && temp_c < 110.0 {
+                return Some(temp_c);
+            }
+        }
+    }
+    None
+}
+
 fn query_nvme_temp_prop50(h: HANDLE) -> Option<f32> {
     let mut buf = [0u8; 48 + 512];
     buf[0..4].copy_from_slice(&50u32.to_le_bytes()); // StorageDeviceProtocolSpecificProperty
@@ -244,7 +278,7 @@ pub fn probe_physical_disks() -> Vec<PhysicalDiskInfo> {
             info.model = format!("PhysicalDrive{}", idx);
         }
 
-        let nvme_temp = query_nvme_temp_prop50(h);
+        let nvme_temp = query_storage_temp_prop10(h).or_else(|| query_nvme_temp_prop50(h));
         info.temperature_c = nvme_temp;
 
         let (iface, raw) = bus_type_name(bus_code);
@@ -834,9 +868,300 @@ impl EmiPowerReader {
     }
 }
 
-pub fn poll_power_info(emi: &mut EmiPowerReader, gpu_watts: Option<f32>, gpu_limit: Option<f32>) -> PowerInfo {
+// ============================================================================
+// 4B. INTEGRATED PAWNIO SIGNED MSR DRIVER READER (Zero WinRing0!)
+// ============================================================================
+
+const PAWNIO_INTEL_MSR_BIN: &[u8] = include_bytes!("../../Assets/pawnio/IntelMSR.bin");
+const PAWNIO_AMD_MSR_BIN: &[u8] = include_bytes!("../../Assets/pawnio/AMDFamily17.bin");
+const IOCTL_PIO_LOAD_BINARY: u32 = (41394u32 << 16) | (0x821u32 << 2);
+const IOCTL_PIO_EXECUTE_FN: u32 = (41394u32 << 16) | (0x841u32 << 2);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CpuVendor {
+    Intel,
+    Amd,
+}
+
+pub struct PawnIoReader {
+    handle: HANDLE,
+    vendor: CpuVendor,
+    energy_unit: f64,
+    tj_max: f32,
+    last_pkg_energy: Option<(u32, Instant)>,
+    last_psys_energy: Option<(u32, Instant)>,
+}
+
+unsafe impl Send for PawnIoReader {}
+
+impl Drop for PawnIoReader {
+    fn drop(&mut self) {
+        if self.handle != INVALID_HANDLE_VALUE && !self.handle.is_null() {
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
+impl PawnIoReader {
+    pub fn try_new(cpu_brand: &str) -> Option<Self> {
+        let vendor = if cpu_brand.to_ascii_lowercase().contains("amd") {
+            CpuVendor::Amd
+        } else {
+            CpuVendor::Intel
+        };
+        let dev_path = to_wide(r"\\?\GLOBALROOT\Device\PawnIO");
+        let h = unsafe {
+            CreateFileW(
+                dev_path.as_ptr(),
+                GENERIC_READ_FLAG | GENERIC_WRITE_FLAG,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE || h.is_null() {
+            return None;
+        }
+
+        let module_bytes = match vendor {
+            CpuVendor::Intel => PAWNIO_INTEL_MSR_BIN,
+            CpuVendor::Amd => PAWNIO_AMD_MSR_BIN,
+        };
+        let mut ret = 0u32;
+        let loaded = unsafe {
+            DeviceIoControl(
+                h,
+                IOCTL_PIO_LOAD_BINARY,
+                module_bytes.as_ptr() as *const c_void,
+                module_bytes.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut ret,
+                std::ptr::null_mut(),
+            )
+        };
+        if loaded == 0 {
+            unsafe { CloseHandle(h) };
+            return None;
+        }
+
+        let mut reader = Self {
+            handle: h,
+            vendor,
+            energy_unit: 0.000_061_035_156_25,
+            tj_max: 100.0,
+            last_pkg_energy: None,
+            last_psys_energy: None,
+        };
+
+        match vendor {
+            CpuVendor::Intel => {
+                if let Some(unit_msr) = reader.read_msr(0x606) {
+                    let esu = ((unit_msr >> 8) & 0x1F) as u32;
+                    if esu > 0 && esu < 31 {
+                        reader.energy_unit = 0.5_f64.powi(esu as i32);
+                    }
+                }
+                if let Some(target_msr) = reader.read_msr(0x1A2) {
+                    let tj = ((target_msr >> 16) & 0xFF) as f32;
+                    if (70.0..=115.0).contains(&tj) {
+                        reader.tj_max = tj;
+                    }
+                }
+            }
+            CpuVendor::Amd => {
+                if let Some(unit_msr) = reader.read_msr(0xC001_0299) {
+                    let esu = ((unit_msr >> 8) & 0x1F) as u32;
+                    if esu > 0 && esu < 31 {
+                        reader.energy_unit = 0.5_f64.powi(esu as i32);
+                    }
+                }
+            }
+        }
+        let _ = reader.poll();
+        Some(reader)
+    }
+
+    fn read_msr(&self, msr: u32) -> Option<u64> {
+        let mut in_buf = [0u8; 40];
+        let fn_name = b"ioctl_read_msr";
+        in_buf[..fn_name.len()].copy_from_slice(fn_name);
+        in_buf[32..40].copy_from_slice(&(msr as u64).to_le_bytes());
+
+        let mut out_val = 0u64;
+        let mut ret = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_PIO_EXECUTE_FN,
+                in_buf.as_ptr() as *const c_void,
+                in_buf.len() as u32,
+                &mut out_val as *mut u64 as *mut c_void,
+                8,
+                &mut ret,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 && ret >= 8 {
+            Some(out_val)
+        } else {
+            None
+        }
+    }
+
+    /// Returns `(cpu_temp_c, cpu_pkg_watts, platform_psys_watts)`
+    pub fn poll(&mut self) -> (Option<f32>, Option<f32>, Option<f32>) {
+        let now = Instant::now();
+        let mut temp_c = None;
+        let mut pkg_w = None;
+        let mut psys_w = None;
+
+        match self.vendor {
+            CpuVendor::Intel => {
+                for msr in [0x1B1u32, 0x19Cu32] {
+                    if let Some(v) = self.read_msr(msr) {
+                        let valid = (v >> 31) & 1 != 0 || msr == 0x1B1;
+                        if valid {
+                            let delta = ((v >> 16) & 0x7F) as f32;
+                            let t = self.tj_max - delta;
+                            if (10.0..=115.0).contains(&t) {
+                                temp_c = Some(t);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some(v) = self.read_msr(0x611) {
+                    let cur = (v & 0xFFFF_FFFF) as u32;
+                    if let Some((prev, pt)) = self.last_pkg_energy {
+                        let dt = now.duration_since(pt).as_secs_f64();
+                        if dt > 0.1 {
+                            let w = (cur.wrapping_sub(prev) as f64) * self.energy_unit / dt;
+                            if w > 0.5 && w < 350.0 {
+                                pkg_w = Some(w as f32);
+                            }
+                        }
+                    }
+                    self.last_pkg_energy = Some((cur, now));
+                }
+                if let Some(v) = self.read_msr(0x64D) {
+                    let cur = (v & 0xFFFF_FFFF) as u32;
+                    if cur != 0 {
+                        if let Some((prev, pt)) = self.last_psys_energy {
+                            let dt = now.duration_since(pt).as_secs_f64();
+                            if dt > 0.1 {
+                                let w = (cur.wrapping_sub(prev) as f64) * self.energy_unit / dt;
+                                if w > 2.0 && w < 450.0 {
+                                    psys_w = Some(w as f32);
+                                }
+                            }
+                        }
+                        self.last_psys_energy = Some((cur, now));
+                    }
+                }
+            }
+            CpuVendor::Amd => {
+                if let Some(v) = self.read_msr(0xC001_029B) {
+                    let cur = (v & 0xFFFF_FFFF) as u32;
+                    if let Some((prev, pt)) = self.last_pkg_energy {
+                        let dt = now.duration_since(pt).as_secs_f64();
+                        if dt > 0.1 {
+                            let w = (cur.wrapping_sub(prev) as f64) * self.energy_unit / dt;
+                            if w > 0.5 && w < 350.0 {
+                                pkg_w = Some(w as f32);
+                            }
+                        }
+                    }
+                    self.last_pkg_energy = Some((cur, now));
+                }
+            }
+        }
+        (temp_c, pkg_w, psys_w)
+    }
+}
+
+/// Native Win32 process image path lookup fallback when sysinfo returns None.
+pub fn query_process_exe_path(pid: u32) -> Option<String> {
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(h);
+        if ok != 0 && len > 0 {
+            let s = String::from_utf16_lossy(&buf[..len as usize]);
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Native Win32 multi-PID termination (handles grouped apps + stubborn child trees cleanly).
+pub fn terminate_processes_win32(pids: &[u32]) -> bool {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut any_killed = false;
+    let mut failed_pids = Vec::new();
+    for &pid in pids {
+        if pid == 0 || pid == std::process::id() {
+            continue;
+        }
+        let mut ok = false;
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() {
+                if TerminateProcess(h, 1) != 0 {
+                    ok = true;
+                }
+                CloseHandle(h);
+            }
+        }
+        if ok {
+            any_killed = true;
+        } else {
+            failed_pids.push(pid);
+        }
+    }
+    if !failed_pids.is_empty() {
+        let mut cmd = std::process::Command::new("taskkill.exe");
+        cmd.arg("/F");
+        for pid in &failed_pids {
+            cmd.arg("/PID").arg(pid.to_string());
+        }
+        if let Ok(st) = cmd.creation_flags(CREATE_NO_WINDOW).status() {
+            if st.success() {
+                any_killed = true;
+            }
+        }
+    }
+    any_killed
+}
+
+pub fn poll_power_info(
+    emi: &mut EmiPowerReader,
+    pawnio_pkg_w: Option<f32>,
+    pawnio_psys_w: Option<f32>,
+    gpu_watts: Option<f32>,
+    gpu_limit: Option<f32>,
+    cpu_usage_pct: f32,
+    cpu_clock_ghz: f32,
+    cpu_base_ghz: f32,
+) -> PowerInfo {
+    let cpu_hw_w = pawnio_pkg_w.or_else(|| emi.poll_cpu_watts());
     let mut p = PowerInfo {
-        cpu_watts: emi.poll_cpu_watts(),
+        cpu_watts: cpu_hw_w,
         gpu_watts,
         gpu_limit_watts: gpu_limit,
         ..Default::default()
@@ -859,7 +1184,6 @@ pub fn poll_power_info(emi: &mut EmiPowerReader, gpu_watts: Option<f32>, gpu_lim
                     .clamp(0.0, 100.0) as u8;
                 p.battery_percent = Some(pct);
             }
-            // Rate is in mW (signed): negative when discharging, positive when charging
             let rate_signed = sbs.Rate as i32;
             if rate_signed != i32::MIN && rate_signed != 0 {
                 let w = (rate_signed.abs() as f32) / 1000.0;
@@ -873,33 +1197,57 @@ pub fn poll_power_info(emi: &mut EmiPowerReader, gpu_watts: Option<f32>, gpu_lim
     if p.on_battery {
         if let Some(bw) = p.battery_watts {
             p.device_total_watts = Some(bw);
+            p.is_estimated = false;
             p.source_note = "Pil / Toplam Cihaz".to_string();
             return p;
         }
     }
 
-    // On AC power: only report Total Device wattage when CPU EMI is actually available;
-    // never misreport GPU-only wattage as total device wattage.
-    match (p.cpu_watts, p.gpu_watts) {
-        (Some(cw), Some(gw)) => {
-            p.device_total_watts = Some(cw + gw + 10.0);
-            p.source_note = "CPU (EMI) + GPU + Sistem".to_string();
-        }
-        (Some(cw), None) => {
-            p.device_total_watts = Some(cw + 10.0);
-            p.source_note = "CPU (EMI) + Sistem".to_string();
-        }
-        (None, _) => {
-            if let Some(bw) = p.battery_watts {
-                p.device_total_watts = Some(bw);
-                p.source_note = "Pil Ölçümü".to_string();
-            } else {
-                p.device_total_watts = None;
-                p.source_note = "Adaptörde (Pil sensörü boşta)".to_string();
-            }
-        }
+    if let Some(psys) = pawnio_psys_w {
+        let total = match p.gpu_watts {
+            Some(gw) if psys < gw + 5.0 => psys + gw,
+            _ => psys,
+        };
+        p.device_total_watts = Some(total);
+        p.is_estimated = false;
+        p.source_note = "PawnIO Donanım (PSys)".to_string();
+        return p;
     }
 
+    if let Some(cw) = p.cpu_watts {
+        let src_tag = if pawnio_pkg_w.is_some() {
+            "PawnIO RAPL"
+        } else {
+            "EMI"
+        };
+        let base_sys = 8.0;
+        if let Some(gw) = p.gpu_watts {
+            p.device_total_watts = Some(cw + gw + base_sys);
+            p.is_estimated = false;
+            p.source_note = format!("{} + GPU + Sistem", src_tag);
+        } else {
+            p.device_total_watts = Some(cw + base_sys);
+            p.is_estimated = false;
+            p.source_note = format!("{} + Sistem", src_tag);
+        }
+        return p;
+    }
+
+    let ratio = if cpu_base_ghz > 0.2 {
+        (cpu_clock_ghz / cpu_base_ghz).clamp(0.4, 2.2)
+    } else {
+        1.0
+    };
+    let est_cpu_w = 5.0 + (cpu_usage_pct.clamp(0.0, 100.0) / 100.0) * 38.0 * ratio.powf(1.2);
+    let base_platform_w = 9.0;
+    let total_est = p.gpu_watts.unwrap_or(0.0) + est_cpu_w + base_platform_w;
+    p.device_total_watts = Some(total_est);
+    p.is_estimated = true;
+    p.source_note = if p.gpu_watts.is_some() {
+        "Tahmini (GPU + CPU/Sistem) — Kesin ölçüm için PawnIO".to_string()
+    } else {
+        "Tahmini (CPU/Sistem) — Kesin ölçüm için PawnIO".to_string()
+    };
     p
 }
 
