@@ -22,8 +22,45 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
+fn build_http_agent() -> Result<ureq::Agent, String> {
+    #[cfg(windows)]
+    {
+        let tls = ureq::native_tls::TlsConnector::new()
+            .map_err(|e| format!("TLS başlatılamadı: {}", e))?;
+        Ok(ureq::AgentBuilder::new()
+            .tls_connector(std::sync::Arc::new(tls))
+            .build())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(ureq::AgentBuilder::new().build())
+    }
+}
+
+/// Checks only PulseGlass GitHub Releases (fast, <1s) so UI updates immediately before slow OS update scan.
+pub fn check_app_update_only(en: bool) -> UpdateCheckResult {
+    let mut res = UpdateCheckResult {
+        checked_at: Local::now().format("%H:%M:%S").to_string(),
+        os_status_msg: if en {
+            "Checking Windows/OS updates...".to_string()
+        } else {
+            "İşletim sistemi güncellemeleri denetleniyor...".to_string()
+        },
+        ..Default::default()
+    };
+    check_app_update(&mut res, en);
+    res
+}
+
+/// Checks OS updates (Windows Important/Optional or Linux package manager) into an existing result.
+pub fn populate_os_updates(res: &mut UpdateCheckResult, en: bool) {
+    check_os_updates(res, en);
+    res.checked_at = Local::now().format("%H:%M:%S").to_string();
+}
+
 /// Checks both PulseGlass GitHub Releases (with PR #1 strict binary asset selection)
 /// and OS updates (Windows Important/Optional or Linux package manager).
+#[allow(dead_code)]
 pub fn check_all_updates(en: bool) -> UpdateCheckResult {
     let mut res = UpdateCheckResult {
         checked_at: Local::now().format("%H:%M:%S").to_string(),
@@ -99,7 +136,20 @@ fn parse_version(v: &str) -> (u32, u32, u32) {
 }
 
 fn check_app_update(res: &mut UpdateCheckResult, en: bool) {
-    let resp = ureq::get(GITHUB_LATEST_API)
+    let agent = match build_http_agent() {
+        Ok(a) => a,
+        Err(e) => {
+            res.app_status_msg = if en {
+                format!("Update check failed: {}", e)
+            } else {
+                format!("Güncelleme denetimi başarısız: {}", e)
+            };
+            return;
+        }
+    };
+
+    let resp = agent
+        .get(GITHUB_LATEST_API)
         .set("User-Agent", &format!("PulseGlass/{}", APP_VERSION))
         .set("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(10))
@@ -178,7 +228,9 @@ pub fn download_and_apply_app_update(download_url: &str, en: bool) -> Result<Str
         "pulseglass.new"
     });
 
-    let resp = ureq::get(download_url)
+    let agent = build_http_agent()?;
+    let resp = agent
+        .get(download_url)
         .set("User-Agent", &format!("PulseGlass/{}", APP_VERSION))
         .timeout(std::time::Duration::from_secs(60))
         .call()
@@ -451,5 +503,24 @@ mod tests {
         fs::write(&tmp, b"MZ\x90\x00").unwrap();
         assert!(has_valid_executable_header(&tmp, true));
         let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn live_github_update_check_uses_native_tls_successfully() {
+        let res = check_app_update_only(false);
+        println!(
+            "UPDATER_LIVE: latest='{}' url='{}' msg='{}'",
+            res.app_latest_version, res.app_download_url, res.app_status_msg
+        );
+        assert!(
+            !res.app_latest_version.is_empty(),
+            "GitHub API check failed: {}",
+            res.app_status_msg
+        );
+        assert!(
+            !res.app_status_msg.contains("başarısız"),
+            "Unexpected failure: {}",
+            res.app_status_msg
+        );
     }
 }
