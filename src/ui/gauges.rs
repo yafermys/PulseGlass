@@ -75,15 +75,21 @@ pub fn glass_card<R>(
     border_accent: Color32,
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> egui::InnerResponse<R> {
+    let base = ui.visuals().extreme_bg_color;
+    let fill = if base.r() > 0 || base.g() > 0 || base.b() > 0 {
+        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 215)
+    } else {
+        Color32::from_rgba_unmultiplied(34, 27, 38, 215)
+    };
     egui::Frame::none()
-        .fill(Color32::from_rgba_unmultiplied(34, 27, 38, 215))
+        .fill(fill)
         .stroke(Stroke::new(
             1.0_f32,
             Color32::from_rgba_unmultiplied(
                 border_accent.r(),
                 border_accent.g(),
                 border_accent.b(),
-                62,
+                68,
             ),
         ))
         .rounding(Rounding::same(11.0))
