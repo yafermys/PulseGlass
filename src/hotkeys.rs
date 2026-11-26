@@ -15,14 +15,17 @@ pub struct HotkeySpec {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
+    pub win: bool,
     pub key: String,
 }
 
 impl HotkeySpec {
+    /// Parses ANY single key or modifier+key combination (e.g. "Insert", "F9", "A", "Ctrl+Alt+S", "Win+Shift+G").
     pub fn parse(s: &str) -> Option<Self> {
         let mut ctrl = false;
         let mut shift = false;
         let mut alt = false;
+        let mut win = false;
         let mut key: Option<String> = None;
 
         for raw in s.split('+') {
@@ -34,6 +37,7 @@ impl HotkeySpec {
                 "ctrl" | "control" => ctrl = true,
                 "shift" => shift = true,
                 "alt" => alt = true,
+                "win" | "super" | "meta" | "cmd" => win = true,
                 other => {
                     key = Some(normalize_key_name(other)?);
                 }
@@ -41,20 +45,21 @@ impl HotkeySpec {
         }
 
         let k = key?;
-        // Allow standalone F1..F12 without modifier, require at least one modifier for regular keys
-        if !ctrl && !shift && !alt && !is_function_key(&k) {
+        // Bare Escape is reserved to cancel capture; Escape with modifiers is allowed.
+        if k == "Escape" && !ctrl && !shift && !alt && !win {
             return None;
         }
         Some(Self {
             ctrl,
             shift,
             alt,
+            win,
             key: k,
         })
     }
 
     pub fn format(&self) -> String {
-        let mut parts = Vec::with_capacity(4);
+        let mut parts = Vec::with_capacity(5);
         if self.ctrl {
             parts.push("Ctrl");
         }
@@ -64,42 +69,30 @@ impl HotkeySpec {
         if self.alt {
             parts.push("Alt");
         }
+        if self.win {
+            parts.push("Win");
+        }
         parts.push(self.key.as_str());
         parts.join("+")
     }
 
     pub fn from_egui_key(modifiers: egui::Modifiers, key: egui::Key) -> Option<Self> {
         let key_name = egui_key_to_name(key)?;
-        let ctrl = modifiers.ctrl || modifiers.command;
+        let ctrl = modifiers.ctrl;
         let shift = modifiers.shift;
         let alt = modifiers.alt;
-        if !ctrl && !shift && !alt && !is_function_key(key_name) {
+        let win = modifiers.mac_cmd || (modifiers.command && !modifiers.ctrl);
+        if key_name == "Escape" && !ctrl && !shift && !alt && !win {
             return None;
         }
         Some(Self {
             ctrl,
             shift,
             alt,
+            win,
             key: key_name.to_string(),
         })
     }
-}
-
-fn is_function_key(k: &str) -> bool {
-    matches!(
-        k,
-        "F1" | "F2"
-            | "F3"
-            | "F4"
-            | "F5"
-            | "F6"
-            | "F7"
-            | "F8"
-            | "F9"
-            | "F10"
-            | "F11"
-            | "F12"
-    )
 }
 
 fn normalize_key_name(lower: &str) -> Option<String> {
@@ -107,6 +100,8 @@ fn normalize_key_name(lower: &str) -> Option<String> {
         "enter" | "return" => "Enter",
         "space" | "spacebar" => "Space",
         "tab" => "Tab",
+        "backspace" | "back" => "Backspace",
+        "escape" | "esc" => "Escape",
         "insert" | "ins" => "Insert",
         "delete" | "del" => "Delete",
         "home" => "Home",
@@ -117,6 +112,17 @@ fn normalize_key_name(lower: &str) -> Option<String> {
         "down" | "arrowdown" => "Down",
         "left" | "arrowleft" => "Left",
         "right" | "arrowright" => "Right",
+        "minus" | "-" => "Minus",
+        "equals" | "=" | "plus" => "Equals",
+        "backtick" | "`" | "grave" => "Backtick",
+        "openbracket" | "[" => "OpenBracket",
+        "closebracket" | "]" => "CloseBracket",
+        "backslash" | "\\" => "Backslash",
+        "semicolon" | ";" => "Semicolon",
+        "quote" | "'" => "Quote",
+        "comma" | "," => "Comma",
+        "period" | "." => "Period",
+        "slash" | "/" => "Slash",
         "f1" => "F1",
         "f2" => "F2",
         "f3" => "F3",
@@ -148,6 +154,8 @@ fn egui_key_to_name(key: egui::Key) -> Option<&'static str> {
         Key::Enter => "Enter",
         Key::Space => "Space",
         Key::Tab => "Tab",
+        Key::Backspace => "Backspace",
+        Key::Escape => "Escape",
         Key::Insert => "Insert",
         Key::Delete => "Delete",
         Key::Home => "Home",
@@ -158,6 +166,17 @@ fn egui_key_to_name(key: egui::Key) -> Option<&'static str> {
         Key::ArrowDown => "Down",
         Key::ArrowLeft => "Left",
         Key::ArrowRight => "Right",
+        Key::Minus => "Minus",
+        Key::Equals | Key::Plus => "Equals",
+        Key::Backtick => "Backtick",
+        Key::OpenBracket => "OpenBracket",
+        Key::CloseBracket => "CloseBracket",
+        Key::Backslash => "Backslash",
+        Key::Semicolon => "Semicolon",
+        Key::Quote => "Quote",
+        Key::Comma => "Comma",
+        Key::Period => "Period",
+        Key::Slash => "Slash",
         Key::F1 => "F1",
         Key::F2 => "F2",
         Key::F3 => "F3",
@@ -216,6 +235,8 @@ fn key_to_win32_vk(key: &str) -> Option<u32> {
         "Enter" => 0x0D,
         "Space" => 0x20,
         "Tab" => 0x09,
+        "Backspace" => 0x08,
+        "Escape" => 0x1B,
         "Insert" => 0x2D,
         "Delete" => 0x2E,
         "Home" => 0x24,
@@ -226,6 +247,17 @@ fn key_to_win32_vk(key: &str) -> Option<u32> {
         "Down" => 0x28,
         "Left" => 0x25,
         "Right" => 0x27,
+        "Minus" => 0xBD,
+        "Equals" => 0xBB,
+        "Backtick" => 0xC0,
+        "OpenBracket" => 0xDB,
+        "CloseBracket" => 0xDD,
+        "Backslash" => 0xDC,
+        "Semicolon" => 0xBA,
+        "Quote" => 0xDE,
+        "Comma" => 0xBC,
+        "Period" => 0xBE,
+        "Slash" => 0xBF,
         "F1" => 0x70,
         "F2" => 0x71,
         "F3" => 0x72,
@@ -257,6 +289,8 @@ fn key_to_linux_code(key: &str) -> Option<global_hotkey::hotkey::Code> {
         "Enter" => Code::Enter,
         "Space" => Code::Space,
         "Tab" => Code::Tab,
+        "Backspace" => Code::Backspace,
+        "Escape" => Code::Escape,
         "Insert" => Code::Insert,
         "Delete" => Code::Delete,
         "Home" => Code::Home,
@@ -267,6 +301,17 @@ fn key_to_linux_code(key: &str) -> Option<global_hotkey::hotkey::Code> {
         "Down" => Code::ArrowDown,
         "Left" => Code::ArrowLeft,
         "Right" => Code::ArrowRight,
+        "Minus" => Code::Minus,
+        "Equals" => Code::Equal,
+        "Backtick" => Code::Backquote,
+        "OpenBracket" => Code::BracketLeft,
+        "CloseBracket" => Code::BracketRight,
+        "Backslash" => Code::Backslash,
+        "Semicolon" => Code::Semicolon,
+        "Quote" => Code::Quote,
+        "Comma" => Code::Comma,
+        "Period" => Code::Period,
+        "Slash" => Code::Slash,
         "F1" => Code::F1,
         "F2" => Code::F2,
         "F3" => Code::F3,
@@ -364,7 +409,7 @@ impl HotkeyManager {
                     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
                     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
                         RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
-                        MOD_SHIFT,
+                        MOD_SHIFT, MOD_WIN,
                     };
                     use windows_sys::Win32::UI::WindowsAndMessaging::{
                         GetMessageW, PeekMessageW, MSG, PM_NOREMOVE, WM_APP, WM_HOTKEY,
@@ -374,7 +419,6 @@ impl HotkeyManager {
                     const ID_SUMMARY: i32 = 9002;
                     const WM_APP_REBIND: u32 = WM_APP + 1;
 
-                    // Ensure thread message queue exists before exposing thread ID
                     let mut dummy: MSG = std::mem::zeroed();
                     PeekMessageW(&mut dummy, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
                     tid_bg.store(GetCurrentThreadId(), Ordering::SeqCst);
@@ -396,6 +440,9 @@ impl HotkeyManager {
                             }
                             if s.alt {
                                 m |= MOD_ALT;
+                            }
+                            if s.win {
+                                m |= MOD_WIN;
                             }
                             m
                         };
@@ -483,6 +530,9 @@ impl HotkeyManager {
                         }
                         if s.alt {
                             mods |= Modifiers::ALT;
+                        }
+                        if s.win {
+                            mods |= Modifiers::SUPER;
                         }
                         let m_opt = if mods.is_empty() { None } else { Some(mods) };
                         Some(HotKey::new(m_opt, code))
@@ -607,12 +657,13 @@ mod tests {
         let s2 = HotkeySpec::parse("Shift + Alt + F9").unwrap();
         assert_eq!(s2.format(), "Shift+Alt+F9");
 
-        let s3 = HotkeySpec::parse("f10").unwrap();
-        assert_eq!(s3.format(), "F10");
-
-        // Regular letter without modifier must be rejected so typing doesn't trigger hotkeys
-        assert!(HotkeySpec::parse("A").is_none());
-        assert!(HotkeySpec::parse("Enter").is_none());
-        assert!(HotkeySpec::parse("Ctrl+G").is_some());
+        // Any single key or Win+combo is now supported!
+        assert_eq!(HotkeySpec::parse("f10").unwrap().format(), "F10");
+        assert_eq!(HotkeySpec::parse("insert").unwrap().format(), "Insert");
+        assert_eq!(HotkeySpec::parse("a").unwrap().format(), "A");
+        assert_eq!(HotkeySpec::parse("win+shift+g").unwrap().format(), "Shift+Win+G");
+        // Bare Escape reserved for cancelling capture
+        assert!(HotkeySpec::parse("Escape").is_none());
+        assert!(HotkeySpec::parse("Ctrl+Escape").is_some());
     }
 }
