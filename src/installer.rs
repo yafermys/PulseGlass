@@ -26,10 +26,98 @@ pub fn is_pawnio_installed() -> bool {
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
         hklm.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO")
             .is_ok()
+            || hklm
+                .open_subkey(r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO")
+                .is_ok()
+            || Path::new(r"C:\Program Files\PawnIO\PawnIO.sys").exists()
     }
     #[cfg(not(windows))]
     {
         true // Linux uses native kernel hwmon/rapl, does not need PawnIO
+    }
+}
+
+/// Downloads and installs the official signed PawnIO driver directly inside PulseGlass (Windows).
+pub fn install_pawnio_driver(en: bool) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        use std::io::Read;
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const PAWNIO_URL: &str =
+            "https://github.com/namazso/PawnIO.Setup/releases/latest/download/PawnIO_setup.exe";
+
+        let tls = ureq::native_tls::TlsConnector::new()
+            .map_err(|e| format!("TLS error: {}", e))?;
+        let agent = ureq::AgentBuilder::new()
+            .tls_connector(std::sync::Arc::new(tls))
+            .build();
+
+        let resp = agent
+            .get(PAWNIO_URL)
+            .set("User-Agent", &format!("PulseGlass/{}", APP_VERSION))
+            .timeout(std::time::Duration::from_secs(45))
+            .call()
+            .map_err(|e| {
+                if en {
+                    format!("PawnIO download failed: {}", e)
+                } else {
+                    format!("PawnIO indirilemedi: {}", e)
+                }
+            })?;
+
+        let tmp_exe = std::env::temp_dir().join("PawnIO_setup_pulseglass.exe");
+        {
+            let mut reader = resp.into_reader();
+            let mut out = fs::File::create(&tmp_exe).map_err(|e| e.to_string())?;
+            std::io::copy(&mut reader, &mut out).map_err(|e| e.to_string())?;
+        }
+
+        // Validate PE 'MZ' header
+        let mut magic = [0u8; 2];
+        let valid = fs::File::open(&tmp_exe)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .is_ok()
+            && magic == [b'M', b'Z'];
+        if !valid {
+            let _ = fs::remove_file(&tmp_exe);
+            return Err(if en {
+                "Downloaded PawnIO installer is invalid.".to_string()
+            } else {
+                "İndirilen PawnIO kurulum dosyası geçersiz.".to_string()
+            });
+        }
+
+        let status = Command::new(&tmp_exe)
+            .args(["-install", "-silent"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map_err(|e| e.to_string())?;
+        let _ = fs::remove_file(&tmp_exe);
+
+        if status.success() || is_pawnio_installed() {
+            Ok(if en {
+                "PawnIO driver installed! Hardware CPU Wattage & Core Temp active.".to_string()
+            } else {
+                "PawnIO sürücüsü kuruldu! Donanımsal CPU Watt ve çekirdek sıcaklığı aktif."
+                    .to_string()
+            })
+        } else {
+            Err(if en {
+                format!("PawnIO installer exited with code {:?}.", status.code())
+            } else {
+                format!("PawnIO kurulumu hata koduyla sonlandı: {:?}.", status.code())
+            })
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(if en {
+            "Linux uses native kernel sensors (PawnIO is Windows-only).".to_string()
+        } else {
+            "Linux çekirdek sensörlerini doğrudan kullanır (PawnIO yalnızca Windows içindir)."
+                .to_string()
+        })
     }
 }
 
@@ -49,20 +137,36 @@ pub fn open_url_non_elevated(url: &str) {
     }
 }
 
-/// Opens the folder containing a given executable path.
+/// Opens the folder containing a given executable path and highlights the file.
 pub fn open_file_location(path: &str) {
-    if path.is_empty() {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
         return;
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("explorer.exe")
-            .arg(format!("/select,\"{}\"", path))
-            .spawn();
+        use std::os::windows::process::CommandExt;
+        // Strip extended-length prefix \\?\ if present and normalize slashes
+        let clean = trimmed
+            .strip_prefix(r"\\?\")
+            .unwrap_or(trimmed)
+            .replace('/', "\\");
+        let p = Path::new(&clean);
+        if p.exists() {
+            // CRITICAL: Use raw_arg so Rust does NOT double-escape quotes inside /select,"..."
+            // (escaped quotes cause explorer.exe to silently fall back to Documents/Belgeler!)
+            let _ = Command::new("explorer.exe")
+                .raw_arg(format!("/select,\"{}\"", clean))
+                .spawn();
+        } else if let Some(parent) = p.parent() {
+            if parent.exists() {
+                let _ = Command::new("explorer.exe").arg(parent).spawn();
+            }
+        }
     }
     #[cfg(target_os = "linux")]
     {
-        if let Some(parent) = Path::new(path).parent() {
+        if let Some(parent) = Path::new(trimmed).parent() {
             let _ = Command::new("xdg-open").arg(parent).spawn();
         }
     }
