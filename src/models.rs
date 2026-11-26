@@ -136,12 +136,14 @@ pub struct PowerInfo {
     pub device_total_watts: Option<f32>,
     pub on_battery: bool,
     pub battery_percent: Option<u8>,
+    pub is_estimated: bool,
     pub source_note: String,
 }
 
 impl PowerInfo {
     pub fn device_text(&self) -> String {
         match self.device_total_watts {
+            Some(w) if self.is_estimated => format!("~{:.1} W", w),
             Some(w) => format!("{:.1} W", w),
             None => "-- W".to_string(),
         }
@@ -172,6 +174,7 @@ pub struct NetworkInfo {
 #[derive(Debug, Clone)]
 pub struct ProcessItem {
     pub pid: u32,
+    pub pids: Vec<u32>,
     pub name: String,
     pub exe_path: String,
     pub instance_count: usize,
