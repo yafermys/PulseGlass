@@ -535,6 +535,8 @@ struct DxgiAdapterDesc1 {
 pub struct DxgiAdapterEntry {
     pub name: String,
     pub luid_tag: String,
+    pub luid_low: u32,
+    pub luid_high: i32,
     pub is_integrated: bool,
     pub total_vram_gb: f32,
     pub shared_vram_gb: f32,
@@ -615,6 +617,8 @@ pub fn enumerate_dxgi_adapters() -> Vec<DxgiAdapterEntry> {
                     out.push(DxgiAdapterEntry {
                         name,
                         luid_tag,
+                        luid_low: desc.luid_low,
+                        luid_high: desc.luid_high,
                         is_integrated,
                         total_vram_gb: ded_gb as f32,
                         shared_vram_gb: shr_gb as f32,
@@ -643,6 +647,15 @@ type FnPdhGetFormattedCounterArrayW = unsafe extern "system" fn(
     *mut u32,
     *mut PdhFmtCounterValueItemW,
 ) -> i32;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PdhGpuSample {
+    pub dgpu_util: Option<f32>,
+    pub dgpu_ded_gb: Option<f32>,
+    pub igpu_util: Option<f32>,
+    pub igpu_ded_gb: Option<f32>,
+    pub igpu_shr_gb: Option<f32>,
+}
 
 /// Native Windows PDH GPU Engine & Adapter Memory reader (works for ALL GPUs: NVIDIA, AMD, Intel iGPU!).
 /// Reads exact Windows Task Manager GPU utilization & VRAM usage with zero subprocesses.
@@ -768,10 +781,11 @@ impl PdhGpuReader {
         }
     }
 
-    /// Returns `(dgpu_util_pct, dgpu_used_vram_gb, igpu_util_pct, igpu_used_vram_gb)`
-    pub fn poll(&self) -> (Option<f32>, Option<f32>, Option<f32>, Option<f32>) {
+    /// Returns live PDH GPU engine utilization & exact Dedicated / Shared adapter memory usage.
+    pub fn poll(&self) -> PdhGpuSample {
+        let mut out = PdhGpuSample::default();
         if unsafe { (self.collect_fn)(self.query) } != 0 {
-            return (None, None, None, None);
+            return out;
         }
 
         let d_tag = self.dgpu_adapter.as_ref().map(|a| a.luid_tag.as_str());
@@ -801,54 +815,283 @@ impl PdhGpuReader {
                 }
             }
         }
-        let d_util = if d_tag.is_some() {
-            Some(
+        if d_tag.is_some() {
+            out.dgpu_util = Some(
                 d_eng
                     .values()
                     .copied()
                     .fold(0.0f64, f64::max)
                     .clamp(0.0, 100.0) as f32,
-            )
-        } else {
-            None
-        };
-        let i_util = if i_tag.is_some() {
-            Some(
+            );
+        }
+        if i_tag.is_some() {
+            out.igpu_util = Some(
                 i_eng
                     .values()
                     .copied()
                     .fold(0.0f64, f64::max)
                     .clamp(0.0, 100.0) as f32,
-            )
-        } else {
-            None
-        };
+            );
+        }
 
-        let mut d_mem_gb = None;
-        let mut i_mem_gb = None;
         for (name, val) in self.read_counter_array(self.ded_mem_counter) {
             let gb = (val / (1024.0 * 1024.0 * 1024.0)) as f32;
             if let Some(dt) = d_tag {
                 if name.contains(dt) && gb >= 0.0 {
-                    d_mem_gb = Some(gb);
+                    out.dgpu_ded_gb = Some(gb);
                 }
             }
             if let Some(it) = i_tag {
-                if name.contains(it) && gb > 0.01 {
-                    i_mem_gb = Some(gb);
+                if name.contains(it) && gb >= 0.0 {
+                    out.igpu_ded_gb = Some(gb);
                 }
             }
         }
-        // Integrated GPUs mainly allocate from Shared System Memory -> read Shared Usage for iGPU!
         for (name, val) in self.read_counter_array(self.shr_mem_counter) {
             let gb = (val / (1024.0 * 1024.0 * 1024.0)) as f32;
             if let Some(it) = i_tag {
                 if name.contains(it) && gb >= 0.0 {
-                    i_mem_gb = Some(i_mem_gb.unwrap_or(0.0) + gb);
+                    out.igpu_shr_gb = Some(gb);
                 }
             }
         }
-        (d_util, d_mem_gb, i_util, i_mem_gb)
+        out
+    }
+}
+
+/// Official Windows WDDM 2.4+ `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA = 62)` temperature reader.
+/// Works natively via `gdi32.dll` for NVIDIA, AMD Radeon dGPU/APU, and Intel Arc without vendor SDKs.
+pub fn query_d3dkmt_adapter_temp(luid_low: u32, luid_high: i32) -> Option<f32> {
+    #[repr(C)]
+    struct Luid {
+        low: u32,
+        high: i32,
+    }
+    #[repr(C)]
+    struct OpenAdapterFromLuid {
+        luid: Luid,
+        h_adapter: u32,
+    }
+    #[repr(C)]
+    struct CloseAdapter {
+        h_adapter: u32,
+    }
+    #[repr(C)]
+    struct QueryAdapterInfo {
+        h_adapter: u32,
+        q_type: u32,
+        data: *mut c_void,
+        data_size: u32,
+    }
+    #[repr(C)]
+    struct AdapterPerfData {
+        physical_adapter_index: u32,
+        memory_frequency: u64,
+        max_memory_frequency: u64,
+        max_memory_frequency_oc: u64,
+        memory_bandwidth: u64,
+        pcie_bandwidth: u64,
+        fan_rpm: u32,
+        power: u32,
+        temperature: u32, // tenths of a degree Celsius
+        power_state_override: u8,
+    }
+    type FnOpen = unsafe extern "system" fn(*mut OpenAdapterFromLuid) -> i32;
+    type FnClose = unsafe extern "system" fn(*const CloseAdapter) -> i32;
+    type FnQuery = unsafe extern "system" fn(*mut QueryAdapterInfo) -> i32;
+
+    let w = to_wide("gdi32.dll");
+    unsafe {
+        let m = LoadLibraryW(w.as_ptr());
+        if m.is_null() {
+            return None;
+        }
+        let open_fn: FnOpen =
+            std::mem::transmute(GetProcAddress(m, b"D3DKMTOpenAdapterFromLuid\0".as_ptr())?);
+        let close_fn: FnClose =
+            std::mem::transmute(GetProcAddress(m, b"D3DKMTCloseAdapter\0".as_ptr())?);
+        let query_fn: FnQuery =
+            std::mem::transmute(GetProcAddress(m, b"D3DKMTQueryAdapterInfo\0".as_ptr())?);
+
+        let mut open = OpenAdapterFromLuid {
+            luid: Luid {
+                low: luid_low,
+                high: luid_high,
+            },
+            h_adapter: 0,
+        };
+        if open_fn(&mut open) != 0 || open.h_adapter == 0 {
+            return None;
+        }
+
+        let mut perf: AdapterPerfData = std::mem::zeroed();
+        let mut q = QueryAdapterInfo {
+            h_adapter: open.h_adapter,
+            q_type: 62, // KMTQAITYPE_ADAPTERPERFDATA
+            data: &mut perf as *mut AdapterPerfData as *mut c_void,
+            data_size: std::mem::size_of::<AdapterPerfData>() as u32,
+        };
+        let ok = query_fn(&mut q) == 0;
+        let close = CloseAdapter {
+            h_adapter: open.h_adapter,
+        };
+        let _ = close_fn(&close);
+
+        if ok && perf.temperature > 50 && perf.temperature < 1300 {
+            return Some((perf.temperature as f32) / 10.0);
+        }
+    }
+    None
+}
+
+/// Native Intel Graphics Control Library (`ControlLib.dll` / IGCL) telemetry reader for Intel iGPU/Arc.
+/// Reads live clock speed (MHz), power consumption (Watts via energy counter), and GT temperature (when supported).
+pub struct IntelIgclReader {
+    api: *mut c_void,
+    device: *mut c_void,
+    close_fn: unsafe extern "C" fn(*mut c_void) -> i32,
+    telemetry_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32,
+    last_energy_j: Option<(f64, f64)>,
+}
+
+unsafe impl Send for IntelIgclReader {}
+
+impl Drop for IntelIgclReader {
+    fn drop(&mut self) {
+        if !self.api.is_null() {
+            unsafe { (self.close_fn)(self.api) };
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IntelIgclSample {
+    pub temp_c: Option<f32>,
+    pub clock_mhz: Option<u32>,
+    pub power_watts: Option<f32>,
+}
+
+impl IntelIgclReader {
+    pub fn try_new() -> Option<Self> {
+        type FnCtlInit = unsafe extern "C" fn(*mut u8, *mut *mut c_void) -> i32;
+        type FnCtlClose = unsafe extern "C" fn(*mut c_void) -> i32;
+        type FnCtlEnumDevices =
+            unsafe extern "C" fn(*mut c_void, *mut u32, *mut *mut c_void) -> i32;
+        type FnCtlPowerTelemetryGet = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+
+        let w = to_wide("ControlLib.dll");
+        unsafe {
+            let m = LoadLibraryW(w.as_ptr());
+            if m.is_null() {
+                return None;
+            }
+            let init_fn: FnCtlInit =
+                std::mem::transmute(GetProcAddress(m, b"ctlInit\0".as_ptr())?);
+            let close_fn: FnCtlClose =
+                std::mem::transmute(GetProcAddress(m, b"ctlClose\0".as_ptr())?);
+            let enum_fn: FnCtlEnumDevices =
+                std::mem::transmute(GetProcAddress(m, b"ctlEnumerateDevices\0".as_ptr())?);
+            let telemetry_fn: FnCtlPowerTelemetryGet =
+                std::mem::transmute(GetProcAddress(m, b"ctlPowerTelemetryGet\0".as_ptr())?);
+
+            // ctl_init_args_t: Size=36, Version=0, AppVersion=1.1 (0x00010001), flags=0, SupportedVersion=0, ApplicationUID={0}
+            let mut args = [0u8; 36];
+            args[0..4].copy_from_slice(&36u32.to_le_bytes());
+            args[4] = 0;
+            args[8..12].copy_from_slice(&0x0001_0001u32.to_le_bytes());
+            let mut api: *mut c_void = std::ptr::null_mut();
+            if init_fn(args.as_mut_ptr(), &mut api) != 0 || api.is_null() {
+                return None;
+            }
+
+            let mut count = 0u32;
+            if enum_fn(api, &mut count, std::ptr::null_mut()) != 0 || count == 0 {
+                close_fn(api);
+                return None;
+            }
+            let mut devs = vec![std::ptr::null_mut::<c_void>(); count as usize];
+            if enum_fn(api, &mut count, devs.as_mut_ptr()) != 0 || devs[0].is_null() {
+                close_fn(api);
+                return None;
+            }
+
+            let mut reader = Self {
+                api,
+                device: devs[0],
+                close_fn,
+                telemetry_fn,
+                last_energy_j: None,
+            };
+            let _ = reader.poll();
+            Some(reader)
+        }
+    }
+
+    pub fn poll(&mut self) -> IntelIgclSample {
+        let mut sample = IntelIgclSample::default();
+        // ctl_power_telemetry_t v0 = 400..640 bytes; allocate 1024 zeroed bytes, set Size=520, Version=0
+        let mut buf = [0u8; 1024];
+        buf[0..4].copy_from_slice(&520u32.to_le_bytes());
+        buf[4] = 0;
+
+        let st = unsafe { (self.telemetry_fn)(self.device, buf.as_mut_ptr() as *mut c_void) };
+        if st != 0 {
+            // Fallback to Size=400 if older IGCL runtime expects compact v0 size
+            buf.fill(0);
+            buf[0..4].copy_from_slice(&400u32.to_le_bytes());
+            if unsafe { (self.telemetry_fn)(self.device, buf.as_mut_ptr() as *mut c_void) } != 0 {
+                return sample;
+            }
+        }
+
+        // Each ctl_oc_telemetry_item_t is 24 bytes starting at offset 8:
+        // +0: bSupported (u8), +4: units (i32), +8: type (i32), +16: value (f64 when type==9)
+        let read_item = |off: usize| -> Option<f64> {
+            if off + 24 > buf.len() || buf[off] == 0 {
+                return None;
+            }
+            let typ = i32::from_le_bytes(buf[off + 8..off + 12].try_into().ok()?);
+            let raw = u64::from_le_bytes(buf[off + 16..off + 24].try_into().ok()?);
+            let val = match typ {
+                9 => f64::from_bits(raw),              // CTL_DATA_TYPE_DOUBLE
+                8 => f32::from_bits(raw as u32) as f64, // CTL_DATA_TYPE_FLOAT
+                6 | 7 => raw as f64,                   // U64 / I64
+                _ => f64::from_bits(raw),
+            };
+            if val.is_finite() {
+                Some(val)
+            } else {
+                None
+            }
+        };
+
+        // item[0] @ 8: timeStamp (s), item[1] @ 32: gpuEnergyCounter (J)
+        if let (Some(ts), Some(energy_j)) = (read_item(8), read_item(32)) {
+            if let Some((prev_ts, prev_e)) = self.last_energy_j {
+                let dt = ts - prev_ts;
+                let de = energy_j - prev_e;
+                if dt > 0.05 && de >= 0.0 {
+                    let w = de / dt;
+                    if (0.05..200.0).contains(&w) {
+                        sample.power_watts = Some(w as f32);
+                    }
+                }
+            }
+            self.last_energy_j = Some((ts, energy_j));
+        }
+        // item[3] @ 80: gpuCurrentClockFrequency (MHz)
+        if let Some(clk) = read_item(80) {
+            if clk > 10.0 && clk < 6000.0 {
+                sample.clock_mhz = Some(clk.round() as u32);
+            }
+        }
+        // item[4] @ 104: gpuCurrentTemperature (°C)
+        if let Some(t) = read_item(104) {
+            if t > 10.0 && t < 125.0 {
+                sample.temp_c = Some(t as f32);
+            }
+        }
+        sample
     }
 }
 

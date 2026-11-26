@@ -97,6 +97,8 @@ fn run_worker(
     #[cfg(windows)]
     let mut pending_pdh_gpu: Option<windows::PdhGpuReader> = None;
     #[cfg(windows)]
+    let mut intel_igcl = windows::IntelIgclReader::try_new();
+    #[cfg(windows)]
     let (reg_dgpu, reg_igpu) = windows::discover_gpus_from_registry();
     #[cfg(windows)]
     let mut emi = windows::EmiPowerReader::new();
@@ -230,40 +232,79 @@ fn run_worker(
             }
 
             // Populate exact DXGI adapter info + live PDH GPU utilization & VRAM for BOTH dGPU and iGPU!
-            let (pdh_d_util, pdh_d_mem, pdh_i_util, pdh_i_mem) = if let Some(ref pg) = pdh_gpu {
+            let mut dgpu_luid: Option<(u32, i32)> = None;
+            let mut igpu_luid: Option<(u32, i32)> = None;
+            let pdh_sample = if let Some(ref pg) = pdh_gpu {
                 if let Some(ref da) = pg.dgpu_adapter {
+                    dgpu_luid = Some((da.luid_low, da.luid_high));
                     if snap.gpu.name.is_empty() {
                         snap.gpu.name = da.name.clone();
                     }
                     snap.gpu.is_available = true;
                     snap.gpu.is_integrated = false;
+                    snap.gpu.dedicated_vram_gb = da.total_vram_gb;
+                    snap.gpu.shared_total_gb = da.shared_vram_gb;
                     if da.total_vram_gb > 0.1 {
                         snap.gpu.total_vram_gb = da.total_vram_gb;
                     }
                 }
                 if let Some(ref ia) = pg.igpu_adapter {
+                    igpu_luid = Some((ia.luid_low, ia.luid_high));
                     if snap.igpu.name.is_empty() {
                         snap.igpu.name = ia.name.clone();
                     }
                     snap.igpu.is_available = true;
                     snap.igpu.is_integrated = true;
-                    if ia.total_vram_gb < 0.5 && ia.shared_vram_gb > 0.5 {
-                        // Integrated GPU uses Shared System Memory (matches Windows Task Manager)
-                        snap.igpu.total_vram_gb = ia.shared_vram_gb;
-                    } else if snap.igpu.total_vram_gb < 0.1 {
-                        snap.igpu.total_vram_gb = ia.total_vram_gb.max(ia.shared_vram_gb);
-                    }
+                    // Real DXGI Dedicated VRAM (e.g. 128 MB on Intel UHD, NOT bogus Registry 2.0 GB!)
+                    snap.igpu.dedicated_vram_gb = ia.total_vram_gb;
+                    snap.igpu.shared_total_gb = ia.shared_vram_gb;
+                    snap.igpu.total_vram_gb = if ia.total_vram_gb >= 0.5 {
+                        ia.total_vram_gb
+                    } else {
+                        ia.shared_vram_gb
+                    };
                 }
                 pg.poll()
             } else {
-                (None, None, None, None)
+                windows::PdhGpuSample::default()
             };
 
-            if let Some(iu) = pdh_i_util {
+            if let Some(iu) = pdh_sample.igpu_util {
                 snap.igpu.usage_percent = iu;
             }
-            if let Some(im) = pdh_i_mem {
-                snap.igpu.used_vram_gb = im;
+            if let Some(shr) = pdh_sample.igpu_shr_gb {
+                snap.igpu.shared_used_gb = shr;
+            }
+            // For UMA iGPUs (<0.5 GB dedicated VRAM), active GPU memory is Shared System Memory (matches Task Manager!)
+            if snap.igpu.dedicated_vram_gb >= 0.5 {
+                if let Some(ded) = pdh_sample.igpu_ded_gb {
+                    snap.igpu.used_vram_gb = ded;
+                }
+            } else if let Some(shr) = pdh_sample.igpu_shr_gb {
+                snap.igpu.used_vram_gb = shr;
+            }
+
+            // Live iGPU telemetry: D3DKMT WDDM sensor -> Intel IGCL (clock, power, GT temp) -> SoC/Package die temp!
+            if snap.igpu.is_available {
+                if let Some((lo, hi)) = igpu_luid {
+                    snap.igpu.temperature_c = windows::query_d3dkmt_adapter_temp(lo, hi);
+                }
+                if let Some(ref mut igcl) = intel_igcl {
+                    let s = igcl.poll();
+                    if snap.igpu.temperature_c.is_none() {
+                        snap.igpu.temperature_c = s.temp_c;
+                    }
+                    snap.igpu.clock_mhz = s.clock_mhz;
+                    snap.igpu.power_watts = s.power_watts;
+                }
+                // On monolithic Intel/AMD CPUs where the iGPU sits on the exact same silicon die as the CPU
+                // and exposes no independent WDDM/IGCL thermistor, report the shared CPU/SoC Package Die temp!
+                if snap.igpu.temperature_c.is_none() {
+                    if let Some(soc_t) = snap.cpu.temperature_c {
+                        snap.igpu.temperature_c = Some(soc_t);
+                        snap.igpu.sensor_note = Some("SoC / Paket".to_string());
+                    }
+                }
             }
 
             // Retry NVML initialization periodically if dGPU woke up from Optimus sleep
@@ -279,11 +320,18 @@ fn run_worker(
                 nvml = windows::NvmlReader::try_new();
             }
 
+            // Universal D3DKMT temperature fallback for AMD/Intel dGPUs (or if NVML unavailable)
+            if snap.gpu.temperature_c.is_none() {
+                if let Some((lo, hi)) = dgpu_luid {
+                    snap.gpu.temperature_c = windows::query_d3dkmt_adapter_temp(lo, hi);
+                }
+            }
+
             // Combine PDH dGPU usage & VRAM seamlessly (works for AMD/Intel dGPUs and NVIDIA Optimus!)
-            if let Some(du) = pdh_d_util {
+            if let Some(du) = pdh_sample.dgpu_util {
                 snap.gpu.usage_percent = snap.gpu.usage_percent.max(du);
             }
-            if let Some(dm) = pdh_d_mem {
+            if let Some(dm) = pdh_sample.dgpu_ded_gb {
                 if snap.gpu.used_vram_gb < 0.01 && dm > 0.01 {
                     snap.gpu.used_vram_gb = dm;
                 }
@@ -551,9 +599,11 @@ mod tests {
                 let _ = r.poll(&mut gpu);
             }
             let pdh_gpu = windows::PdhGpuReader::try_new();
+            let mut igcl = windows::IntelIgclReader::try_new();
             std::thread::sleep(Duration::from_millis(250));
             let pdh_gpu_vals = pdh_gpu.as_ref().map(|p| p.poll());
-            eprintln!("PDH_GPU_CHECK: {:?}", pdh_gpu_vals);
+            let igcl_vals = igcl.as_mut().map(|r| r.poll());
+            eprintln!("PDH_GPU_CHECK: {:?} | IGCL_CHECK: {:?}", pdh_gpu_vals, igcl_vals);
             let mut emi = windows::EmiPowerReader::new();
             std::thread::sleep(Duration::from_millis(300));
             let pwr = windows::poll_power_info(

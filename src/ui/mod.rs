@@ -1678,10 +1678,17 @@ impl PulseGlassApp {
                 ui.add_space(2.0);
                 ui.label(RichText::new(tr.t("Dahili GPU", "Integrated GPU")).strong().size(11.0).color(Color32::from_rgb(255, 232, 224)));
                 let sub = if snap.igpu.is_available {
-                    if snap.igpu.used_vram_gb >= 0.05 && snap.igpu.total_vram_gb >= 0.1 {
+                    if snap.igpu.dedicated_vram_gb < 0.5 && snap.igpu.shared_total_gb >= 0.1 {
+                        format!(
+                            "{}: {:.1} / {:.1} GB",
+                            tr.t("Payl", "Shr"),
+                            snap.igpu.shared_used_gb,
+                            snap.igpu.shared_total_gb
+                        )
+                    } else if snap.igpu.used_vram_gb >= 0.05 && snap.igpu.total_vram_gb >= 0.1 {
                         format!("{:.1} / {:.1} GB", snap.igpu.used_vram_gb, snap.igpu.total_vram_gb)
                     } else {
-                        format!("{:.1} GB", snap.igpu.total_vram_gb.max(snap.igpu.used_vram_gb))
+                        snap.igpu.dedicated_vram_label()
                     }
                 } else {
                     tr.t("Yok", "None").to_string()
@@ -1896,10 +1903,17 @@ impl PulseGlassApp {
                     ui.add_space(4.0);
                     ui.label(RichText::new(tr.t("Dahili GPU (iGPU)", "Integrated GPU")).strong().size(11.0).color(Color32::from_rgb(255, 241, 235)));
                     let sub = if snap.igpu.is_available {
-                        if snap.igpu.used_vram_gb >= 0.05 && snap.igpu.total_vram_gb >= 0.1 {
+                        if snap.igpu.dedicated_vram_gb < 0.5 && snap.igpu.shared_total_gb >= 0.1 {
+                            format!(
+                                "{}: {:.1} / {:.1} GB",
+                                tr.t("Payl", "Shr"),
+                                snap.igpu.shared_used_gb,
+                                snap.igpu.shared_total_gb
+                            )
+                        } else if snap.igpu.used_vram_gb >= 0.05 && snap.igpu.total_vram_gb >= 0.1 {
                             format!("{:.1} / {:.1} GB", snap.igpu.used_vram_gb, snap.igpu.total_vram_gb)
                         } else {
-                            format!("{:.1} GB", snap.igpu.total_vram_gb.max(snap.igpu.used_vram_gb))
+                            snap.igpu.dedicated_vram_label()
                         }
                     } else {
                         tr.t("Algılanmadı", "Not Detected").to_string()
@@ -2179,12 +2193,26 @@ impl PulseGlassApp {
             glass_card(ui, secondary, |ui| {
                 ui.label(RichText::new(tr.t("DAHİLİ GPU (iGPU)", "INTEGRATED GPU")).strong().size(11.0).color(secondary));
                 ui.label(RichText::new(&snap.igpu.name).strong().size(12.5).color(Color32::from_rgb(255, 241, 235)));
+                let temp_disp = match (&snap.igpu.temperature_c, &snap.igpu.sensor_note) {
+                    (Some(t), Some(note)) => format!("{:.0}°C ({})", t, note),
+                    (Some(t), None) => format!("{:.0}°C", t),
+                    _ => "--°C".to_string(),
+                };
                 ui.label(
                     RichText::new(format!(
-                        "{}: {:.0}%   |   VRAM: {}   |   {}: {}",
+                        "{}: {:.0}%   |   {}: {}   |   {}: {}   |   {}: {}\n{}: {}   |   {}: {}   |   {}: {}",
                         tr.t("Kullanım", "Usage"),
                         snap.igpu.usage_percent,
-                        snap.igpu.vram_text(),
+                        tr.t("Sıcaklık", "Temp"),
+                        temp_disp,
+                        tr.t("Saat Hızı", "Clock"),
+                        snap.igpu.clock_mhz.map(|c| format!("{} MHz", c)).unwrap_or_else(|| "N/A".to_string()),
+                        tr.t("Güç", "Power"),
+                        snap.igpu.power_text(),
+                        tr.t("Adanmış VRAM", "Dedicated VRAM"),
+                        snap.igpu.dedicated_vram_label(),
+                        tr.t("Paylaşılan Bellek", "Shared Memory"),
+                        snap.igpu.shared_mem_text(),
                         tr.t("Sürücü", "Driver"),
                         if snap.igpu.driver_version.is_empty() { "N/A" } else { &snap.igpu.driver_version }
                     ))

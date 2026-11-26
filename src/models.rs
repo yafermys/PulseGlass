@@ -33,6 +33,9 @@ pub struct GpuInfo {
     pub temperature_c: Option<f32>,
     pub used_vram_gb: f32,
     pub total_vram_gb: f32,
+    pub dedicated_vram_gb: f32,
+    pub shared_used_gb: f32,
+    pub shared_total_gb: f32,
     pub clock_mhz: Option<u32>,
     pub fan_percent: Option<u32>,
     pub power_watts: Option<f32>,
@@ -54,6 +57,26 @@ impl GpuInfo {
             format!("{:.1} / {:.1} GB", self.used_vram_gb, self.total_vram_gb)
         } else if self.used_vram_gb > 0.0 {
             format!("{:.2} GB", self.used_vram_gb)
+        } else {
+            "N/A".to_string()
+        }
+    }
+
+    pub fn dedicated_vram_label(&self) -> String {
+        if self.dedicated_vram_gb >= 0.95 {
+            format!("{:.1} GB", self.dedicated_vram_gb)
+        } else if self.dedicated_vram_gb > 0.005 {
+            format!("{:.0} MB", (self.dedicated_vram_gb * 1024.0).round())
+        } else {
+            "N/A".to_string()
+        }
+    }
+
+    pub fn shared_mem_text(&self) -> String {
+        if self.shared_total_gb >= 0.1 {
+            format!("{:.1} / {:.1} GB", self.shared_used_gb, self.shared_total_gb)
+        } else if self.shared_used_gb > 0.01 {
+            format!("{:.1} GB", self.shared_used_gb)
         } else {
             "N/A".to_string()
         }
